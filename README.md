@@ -1,6 +1,11 @@
-# Instalador de PostgreSQL 18 para CentOS Stream 10 / RHEL 10
+# Instalador de PostgreSQL 18 (CentOS/RHEL 10 y Ubuntu/Debian)
 
-Script único `install-postgres18.sh`. Instalación nativa (dnf + systemd), sin Docker ni Podman.
+| Sistema | Script | Instalación |
+|---|---|---|
+| CentOS Stream 10 / RHEL 10 / Rocky / Alma 10 | `install-postgres18.sh` | dnf + systemd |
+| Ubuntu 22.04 / 24.04 / 26.04, Debian 12 / 13 | `install-postgres18-ubuntu.sh` | apt + systemd |
+
+Los dos instalan lo mismo y aceptan **las mismas opciones**. Instalación nativa, sin Docker ni Podman.
 Pensado para servidores donde **ya corre otro sistema**: no borra ni sobrescribe nada existente.
 
 Incluye (opcional): observabilidad (postgres_exporter + Prometheus + Grafana) y pgAdmin 4 web.
@@ -10,6 +15,33 @@ Apertura de puertos del firewall configurable.
 - Ejecutar como root (`sudo`).
 - **Conexión a internet** en el servidor: usa los repositorios de PostgreSQL (PGDG), Grafana y
   GitHub (exporter y Prometheus). No funciona sin conexión.
+
+## Diferencias en Ubuntu / Debian
+
+| | CentOS / RHEL | Ubuntu / Debian |
+|---|---|---|
+| Repositorio PostgreSQL | PGDG yum | `apt.postgresql.org` (llave de `postgresql-common`) |
+| Datos | `/var/lib/pgsql/18/data` | `/var/lib/postgresql/18/main` |
+| Configuración | `/var/lib/pgsql/18/data` | `/etc/postgresql/18/main` (+ `conf.d/90-install-script.conf`) |
+| Binarios | `/usr/pgsql-18/bin` | `/usr/lib/postgresql/18/bin` |
+| Servicio | `postgresql-18` | `postgresql@18-main` |
+| Firewall | firewalld | ufw (o firewalld si es el que está activo) |
+| pgAdmin web | httpd | apache2 |
+| Grafana | repo rpm.grafana.com | repo apt.grafana.com |
+
+Detalles propios del script de Ubuntu:
+- Si el cluster `18/main` **no existía**, el paquete crea uno automático (puerto libre y locale del
+  entorno, que puede quedar en `SQL_ASCII`); el script lo reemplaza por uno vacío con el puerto
+  indicado, `UTF8`, checksums y `scram-sha-256`. Locale: el del sistema si es UTF-8, si no `C.UTF-8`
+  (cámbielo con `--locale es_VE.UTF-8`, por ejemplo). Si el cluster **ya existía**, no se toca.
+- Si un repositorio apt nuevo (PGDG, Grafana, pgAdmin) falla en `apt-get update`, se retira solo,
+  para no dejar roto el `apt` del servidor.
+- ufw: solo agrega reglas si está **activo**; nunca lo activa (podría cortar su SSH).
+
+```bash
+sudo bash install-postgres18-ubuntu.sh --dry-run
+sudo bash install-postgres18-ubuntu.sh --all --open-all
+```
 
 ## Uso desde una memoria USB
 
@@ -27,6 +59,8 @@ Apertura de puertos del firewall configurable.
    ```bash
    sudo bash /mnt/usb/postgres18-installer/install-postgres18.sh --dry-run   # simulacion
    sudo bash /mnt/usb/postgres18-installer/install-postgres18.sh --all --open-all
+   # En Ubuntu / Debian:
+   sudo bash /mnt/usb/postgres18-installer/install-postgres18-ubuntu.sh --all --open-all
    ```
    Si prefiere copiarlo al servidor:
    ```bash
@@ -67,8 +101,13 @@ Todas las opciones: `bash install-postgres18.sh --help`
 
 ## Verificación
 ```bash
+# CentOS / RHEL
 systemctl status postgresql-18
 sudo -u postgres /usr/pgsql-18/bin/psql -p 5432 -c "select version();"
+# Ubuntu / Debian
+systemctl status postgresql@18-main
+pg_lsclusters
+sudo -u postgres psql -p 5432 -c "select version();"
 # Grafana:  http://IP:3000      pgAdmin: http://IP:5050/pgadmin4
 ```
 
@@ -81,5 +120,5 @@ sudo -u postgres /usr/pgsql-18/bin/psql -p 5432 -c "select version();"
 `.gitattributes` fuerza finales de línea LF para evitar el problema de `\r`.
 Para que el repo conserve el permiso de ejecución:
 ```bash
-git add --chmod=+x install-postgres18.sh
+git add --chmod=+x install-postgres18.sh install-postgres18-ubuntu.sh
 ```
