@@ -290,6 +290,27 @@ install_repo() {
 }
 
 # ----------------------------- 2) PostgreSQL ---------------------------------
+locale_exists() { # es_VE.UTF-8 -> busca es_VE.utf8 en 'locale -a'
+  local l="${1/.UTF-8/.utf8}"; l="${l/.utf-8/.utf8}"
+  locale -a 2>/dev/null | grep -qix -e "$1" -e "$l"
+}
+ensure_locale() { # genera el locale si no existe (comun en VPS: solo traen en_US / C.UTF-8)
+  local loc="$1"
+  [[ "$loc" == C.UTF-8 || "$loc" == C.utf8 ]] && return 0
+  locale_exists "$loc" && return 0
+  info "El locale ${loc} no esta generado en el sistema: generandolo..."
+  apt_install locales
+  if [[ "$DRY_RUN" == 1 ]]; then echo "DRY: locale-gen ${loc}"; return 0; fi
+  if grep -Eq "^#\s*${loc//./\.}(\s|$)" /etc/locale.gen 2>/dev/null; then
+    backup /etc/locale.gen   # Debian: hay que descomentarlo en /etc/locale.gen
+    sed -i -E "s/^#\s*(${loc//./\.}(\s|$))/\1/" /etc/locale.gen
+    locale-gen
+  else
+    locale-gen "$loc"        # Ubuntu: acepta el locale como argumento
+  fi
+  locale_exists "$loc" || die "No se pudo generar el locale ${loc}. Use otro con --locale (ej: es_ES.UTF-8 o C.UTF-8). No se creo el cluster."
+}
+
 install_postgres() {
   local fresh=0 pre_exists=0
   [[ -f "${PGDATA}/PG_VERSION" ]] && pre_exists=1
@@ -317,6 +338,7 @@ install_postgres() {
       fi
       [[ -e "$PGCONF" ]] && die "Existe ${PGCONF} sin datos en ${PGDATA}. Reviselo a mano; no se modifico."
     fi
+    ensure_locale "$PG_LOCALE"
     info "Creando cluster ${PG_VERSION}/${PG_CLUSTER} (puerto ${PG_PORT}, UTF8, ${PG_LOCALE})..."
     run pg_createcluster "$PG_VERSION" "$PG_CLUSTER" --port "$PG_PORT" --encoding UTF8 --locale "$PG_LOCALE" \
       -- --auth-local=peer --auth-host=scram-sha-256 --data-checksums
@@ -687,6 +709,10 @@ info "PostgreSQL ${PG_VERSION}: cluster ${PG_VERSION}/${PG_CLUSTER}, puerto ${PG
 info "Configuracion: ${PGCONF} (ajustes propios en conf.d/90-install-script.conf), servicio ${SVC}"
 if [[ -f "$CRED_FILE" ]]; then info "Credenciales: ${CRED_FILE} (solo root)"; fi
 info "Conexion local: sudo -u postgres psql -p ${PG_PORT}"
-info "Respaldos de configuracion: *.bak-${STAMP}"
-info "Estado previo guardado en: ${SNAP_DIR}"
+if [[ "$DRY_RUN" == 1 ]]; then
+  warn "SIMULACION (--dry-run): no se instalo ni se cambio nada. Quite --dry-run para instalar."
+else
+  info "Respaldos de configuracion: *.bak-${STAMP}"
+  info "Estado previo guardado en: ${SNAP_DIR}"
+fi
 info "Log completo: ${LOG_FILE}"

@@ -628,6 +628,10 @@ info "================== RESUMEN =================="
 info "PostgreSQL ${PG_VERSION}: puerto ${PG_PORT}, datos en ${PGDATA}, servicio ${SVC}"
 if [[ -f "$CRED_FILE" ]]; then info "Credenciales: ${CRED_FILE} (solo root)"; fi
 info "Conexion local: sudo -u postgres ${PGBIN}/psql -p ${PG_PORT}"
-info "Respaldos de configuracion: *.bak-${STAMP}"
-info "Estado previo guardado en: ${SNAP_DIR}"
+if [[ "$DRY_RUN" == 1 ]]; then
+  warn "SIMULACION (--dry-run): no se instalo ni se cambio nada. Quite --dry-run para instalar."
+else
+  info "Respaldos de configuracion: *.bak-${STAMP}"
+  info "Estado previo guardado en: ${SNAP_DIR}"
+fi
 info "Log completo: ${LOG_FILE}"
