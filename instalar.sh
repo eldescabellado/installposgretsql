@@ -44,8 +44,9 @@ main() {
   esac
 
   local url="https://raw.githubusercontent.com/${repo}/${ref}/${script}"
-  local tmp; tmp="$(mktemp /tmp/pg18-installer.XXXXXX)"
-  trap 'rm -f "$tmp"' EXIT
+  PG18_TMP="$(mktemp /tmp/pg18-installer.XXXXXX)"
+  trap 'rm -f "${PG18_TMP:-}"' EXIT
+  local tmp="$PG18_TMP"
 
   echo -e "\e[32m[+]\e[0m Sistema: ${PRETTY_NAME:-?}  ->  ${script} (${ref})"
   if command -v curl >/dev/null 2>&1; then

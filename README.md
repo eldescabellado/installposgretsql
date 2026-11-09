@@ -16,6 +16,24 @@ Apertura de puertos del firewall configurable.
 - **Conexión a internet** en el servidor: usa los repositorios de PostgreSQL (PGDG), Grafana y
   GitHub (exporter y Prometheus). No funciona sin conexión.
 
+## Instalación con un solo comando (sin clonar)
+
+Detecta si el servidor es Ubuntu/Debian o CentOS/RHEL, descarga el script que corresponde y lo ejecuta:
+```bash
+curl -fsSL https://raw.githubusercontent.com/eldescabellado/installposgretsql/main/instalar.sh | sudo bash
+```
+Con opciones (todo lo que va después de `bash -s --` se pasa al instalador):
+```bash
+curl -fsSL https://raw.githubusercontent.com/eldescabellado/installposgretsql/main/instalar.sh | sudo bash -s -- --all --open-all
+```
+Para revisar el script antes de ejecutarlo (lo deja en `/root`):
+```bash
+curl -fsSL https://raw.githubusercontent.com/eldescabellado/installposgretsql/main/instalar.sh | sudo bash -s -- --solo-descargar
+```
+- La pregunta de la clave funciona igual: se lee del teclado aunque el script venga por `curl |`.
+- `--ref RAMA_O_TAG` usa otra rama o versión del repositorio (por defecto `main`).
+- Si no hay `curl` usa `wget`: `wget -qO- .../instalar.sh | sudo bash`
+
 ## Diferencias en Ubuntu / Debian
 
 | | CentOS / RHEL | Ubuntu / Debian |
