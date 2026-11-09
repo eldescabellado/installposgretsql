@@ -646,7 +646,13 @@ install_pgadmin() {
   local created_listen=0 listen_conf="/etc/apache2/conf-available/pgadmin4-port.conf"
   if [[ "$PGADMIN_PORT" != "80" && "$DRY_RUN" != 1 ]]; then
     if ! grep -rqsE "^\s*Listen\s+(\S+:)?${PGADMIN_PORT}\s*$" /etc/apache2/ports.conf /etc/apache2/conf-enabled /etc/apache2/sites-enabled 2>/dev/null; then
-      echo "Listen ${PGADMIN_PORT}" > "$listen_conf"
+      # Listen propio + la raiz de ESTE puerto redirige a /pgadmin4/ (los demas puertos no cambian)
+      cat > "$listen_conf" <<EOF
+Listen ${PGADMIN_PORT}
+<If "%{SERVER_PORT} == '${PGADMIN_PORT}' && %{REQUEST_URI} == '/'">
+    Redirect "/pgadmin4/"
+</If>
+EOF
       a2enconf -q pgadmin4-port
       created_listen=1
     fi
