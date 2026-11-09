@@ -112,7 +112,11 @@ backup() { # respalda un archivo si existe
 
 port_in_use() { ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .; }
 
-usage() { awk 'NR>1 && /^#/ {print; next} NR>1 {exit}' "$0"; exit 0; }
+usage() {
+  if [[ -f "$0" ]]; then awk 'NR>1 && /^#/ {print; next} NR>1 {exit}' "$0"
+  else echo "Ayuda completa: https://github.com/eldescabellado/installposgretsql#readme"; fi
+  exit 0
+}
 
 # ----------------------------- Argumentos ------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -157,11 +161,15 @@ done
 
 # ----------------------------- Clave de administracion -----------------------
 # Por defecto Jema2026#. Si hay terminal y no se indico --password, se ofrece cambiarla.
-if [[ $PASS_GIVEN -eq 0 && $NO_PROMPT -eq 0 && "$DRY_RUN" != 1 && -t 0 ]]; then
+# Se lee del teclado (/dev/tty) para que tambien funcione con: curl ... | sudo bash
+TTY_IN=""
+if [[ -t 0 ]]; then TTY_IN=/dev/stdin
+elif { : < /dev/tty; } 2>/dev/null; then TTY_IN=/dev/tty; fi
+if [[ $PASS_GIVEN -eq 0 && $NO_PROMPT -eq 0 && "$DRY_RUN" != 1 && -n "$TTY_IN" ]]; then
   echo "Clave de administracion (postgres, pgAdmin, Grafana)."
-  read -rsp "Escriba otra clave o presione Enter para usar la por defecto (${DEFAULT_PASS}): " _p1; echo
+  read -rsp "Escriba otra clave o presione Enter para usar la por defecto (${DEFAULT_PASS}): " _p1 < "$TTY_IN"; echo
   if [[ -n "$_p1" ]]; then
-    read -rsp "Repita la clave: " _p2; echo
+    read -rsp "Repita la clave: " _p2 < "$TTY_IN"; echo
     [[ "$_p1" == "$_p2" ]] || die "Las claves no coinciden. No se modifico nada."
     ADMIN_PASS="$_p1"
   fi
@@ -620,6 +628,10 @@ info "================== RESUMEN =================="
 info "PostgreSQL ${PG_VERSION}: puerto ${PG_PORT}, datos en ${PGDATA}, servicio ${SVC}"
 if [[ -f "$CRED_FILE" ]]; then info "Credenciales: ${CRED_FILE} (solo root)"; fi
 info "Conexion local: sudo -u postgres ${PGBIN}/psql -p ${PG_PORT}"
-info "Respaldos de configuracion: *.bak-${STAMP}"
-info "Estado previo guardado en: ${SNAP_DIR}"
+if [[ "$DRY_RUN" == 1 ]]; then
+  warn "SIMULACION (--dry-run): no se instalo ni se cambio nada. Quite --dry-run para instalar."
+else
+  info "Respaldos de configuracion: *.bak-${STAMP}"
+  info "Estado previo guardado en: ${SNAP_DIR}"
+fi
 info "Log completo: ${LOG_FILE}"
