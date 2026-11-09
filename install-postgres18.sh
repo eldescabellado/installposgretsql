@@ -35,7 +35,7 @@
 #   --prometheus-port N    (def: 9090, solo localhost)
 #   --exporter-port N      (def: 9187, solo localhost)
 #   --pgadmin-port N       (def: 5050)  URL: http://IP:PUERTO/pgadmin4
-#   --pgadmin-email E      (def: admin@localhost.local)
+#   --pgadmin-email E      (def: admin@example.com)
 #   --password CLAVE       Clave de administracion para postgres (si el cluster es nuevo),
 #                          pgAdmin y Grafana (si se instala nuevo). Def: Jema2026#
 #                          (tambien por variable ADMIN_PASSWORD, que evita dejarla en el historial)
@@ -72,7 +72,7 @@ GRAFANA_PORT="${GRAFANA_PORT:-3000}"
 PROMETHEUS_PORT="${PROMETHEUS_PORT:-9090}"
 EXPORTER_PORT="${EXPORTER_PORT:-9187}"
 PGADMIN_PORT="${PGADMIN_PORT:-5050}"
-PGADMIN_EMAIL="${PGADMIN_EMAIL:-admin@localhost.local}"
+PGADMIN_EMAIL="${PGADMIN_EMAIL:-admin@example.com}"
 OPEN_OBS="${OPEN_OBS:-0}"
 OPEN_PGADMIN="${OPEN_PGADMIN:-0}"
 OPEN_PG="${OPEN_PG:-0}"
@@ -176,6 +176,14 @@ if [[ $PASS_GIVEN -eq 0 && $NO_PROMPT -eq 0 && "$DRY_RUN" != 1 && -n "$TTY_IN" ]
   unset _p1 _p2
 fi
 [[ ${#ADMIN_PASS} -ge 8 ]] || die "La clave debe tener al menos 8 caracteres."
+# pgAdmin rechaza correos con dominios reservados (.local, .localhost, .test, ...): la cuenta no se crearia.
+if [[ "$WITH_PGADMIN" == 1 ]]; then
+  [[ "$PGADMIN_EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[A-Za-z]{2,}$ ]] || die "Correo de pgAdmin invalido: ${PGADMIN_EMAIL}"
+  case "${PGADMIN_EMAIL##*.}" in
+    local|localhost|test|invalid|arpa|onion|LOCAL|LOCALHOST|TEST|INVALID|ARPA|ONION)
+      die "pgAdmin no acepta correos terminados en .${PGADMIN_EMAIL##*.} (${PGADMIN_EMAIL}). Use otro, ej: --pgadmin-email admin@example.com";;
+  esac
+fi
 if [[ "$ADMIN_PASS" == "$DEFAULT_PASS" && ( "$PG_LISTEN" != "localhost" || "$OPEN_PG" == 1 || "$OPEN_PGADMIN" == 1 || "$OPEN_OBS" == 1 ) ]]; then
   CLAVE_DEFECTO_EXPUESTA=1
 else
