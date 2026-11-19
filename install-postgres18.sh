@@ -21,13 +21,46 @@
 #   - Antes de cambiar algo guarda una foto del estado en /root/preinstall-snapshot-*.
 #
 # USO:
-#   sudo ./install-postgres18.sh [opciones]
+#   sudo bash install-postgres18.sh [opciones]
 #
-# OPCIONES (tambien se pueden pasar como variables de entorno):
-#   --pg-port N            Puerto de PostgreSQL            (def: 5432)
-#   --listen DIRS          listen_addresses                (def: localhost)
-#   --allow-cidr CIDR      Red permitida remota, ej 10.0.0.0/24 (def: vacio = sin restriccion
-#                          de origen en el firewall; en pg_hba solo si se define)
+# OPCIONES (tambien se pueden pasar como variables de entorno).
+# Si no se indican y hay terminal, el script PREGUNTA puerto, acceso remoto e IPs permitidas.
+#
+#  Puerto y acceso remoto a la base de datos
+#   --pg-port N            Puerto de PostgreSQL (def: 5432)
+#   --remote               Permite conexiones remotas: listen_addresses='*', reglas en pg_hba.conf,
+#                          SSL y apertura del puerto en el firewall, todo de una vez
+#   --allow-cidr LISTA     IPs o redes permitidas, separadas por coma (ej: 190.1.2.3,10.0.0.0/24).
+#                          Sin lista, --remote permite CUALQUIER IP (exige una clave propia).
+#                          Tambien limita el origen de los puertos que se abren (pgAdmin, Grafana)
+#   --no-ssl-required      Acepta conexiones remotas sin cifrar (pg_hba 'host' en vez de 'hostssl')
+#   --block-postgres-remote  El superusuario 'postgres' solo entra desde este servidor (recomendado
+#                          junto con --app-user)
+#   --listen DIRS          listen_addresses explicito (def: localhost; distinto de localhost = --remote)
+#   --local-only           Solo conexiones desde este servidor (no pregunta)
+#   --configure-existing   Aplica puerto / acceso remoto / rendimiento a un cluster que YA existe:
+#                          respalda, reinicia PostgreSQL y revierte solo si no arranca
+#
+#  Usuario y base de la aplicacion
+#   --app-user NOMBRE      Crea un rol con login para la aplicacion (ej: erp_app)
+#   --app-db NOMBRE        Crea la base con ese rol como dueno (def: igual al usuario)
+#   --app-password CLAVE   Clave del rol (def: generada; tambien variable APP_PASSWORD)
+#
+#  Rendimiento
+#   --tune / --no-tune     Ajusta memoria y paralelismo segun RAM y CPU (def: si, en cluster nuevo)
+#   --max-connections N    (def: 100)
+#   --ram-mb N             RAM a considerar en MB (def: la del servidor; util si comparte con otro sistema)
+#   --no-pg-stat-statements  No activa pg_stat_statements (estadisticas de consultas)
+#
+#  Firewall
+#   --open-pg              Abre el puerto de PostgreSQL aunque no use --remote
+#   --open-pgadmin         Abre en firewall el puerto de pgAdmin   (def: no)
+#   --open-observability   Abre en firewall el puerto de Grafana   (def: no)
+#   --open-all             Abre PostgreSQL + Grafana + pgAdmin
+#   --extra-ports LISTA    Puertos adicionales a abrir, separados por coma (ej: 8080,9000)
+#   --enable-firewall      Si firewalld esta inactivo, lo activa (permitiendo antes SSH)
+#
+#  Componentes opcionales
 #   --with-observability   Instala postgres_exporter + Prometheus + Grafana
 #   --with-pgadmin         Instala pgAdmin 4 (modo web, via Apache httpd)
 #   --all                  Equivale a las dos anteriores
@@ -36,23 +69,21 @@
 #   --exporter-port N      (def: 9187, solo localhost)
 #   --pgadmin-port N       (def: 5050)  URL: http://IP:PUERTO/pgadmin4
 #   --pgadmin-email E      (def: admin@example.com)
+#   --force-pgadmin        Instala pgAdmin aunque httpd ya este activo (afecta a sus sitios)
+#
+#  General
 #   --password CLAVE       Clave de administracion para postgres (si el cluster es nuevo),
 #                          pgAdmin y Grafana (si se instala nuevo). Def: Jema2026#
 #                          (tambien por variable ADMIN_PASSWORD, que evita dejarla en el historial)
 #                          Si no la indica y hay terminal, el script le pregunta: Enter = Jema2026#
-#   --yes                  No preguntar nada (usa la clave por defecto o la de --password)
-#   --force-pgadmin        Instala pgAdmin aunque httpd ya este activo (afecta a sus sitios)
-#   --open-observability   Abre en firewall el puerto de Grafana (def: no)
-#   --open-pgadmin         Abre en firewall el puerto de pgAdmin   (def: no)
-#   --open-pg              Abre en firewall el puerto de PostgreSQL (se abre solo si listen != localhost)
-#   --open-all             Abre PostgreSQL + Grafana + pgAdmin en el firewall
-#   --extra-ports LISTA    Puertos adicionales a abrir, separados por coma (ej: 8080,9000)
+#   --yes                  No preguntar nada (usa los valores por defecto u opciones dadas)
 #   --dry-run              Muestra lo que haria sin ejecutar
 #   -h | --help
 #
-# EJEMPLO:
-#   sudo ./install-postgres18.sh --all --pg-port 5433 --listen '*' \
-#        --allow-cidr 192.168.1.0/24 --open-all
+# EJEMPLOS:
+#   sudo bash install-postgres18.sh --pg-port 5433 --remote --allow-cidr 190.1.2.3 \
+#        --app-user erp_app --app-db erp_db --block-postgres-remote
+#   sudo bash install-postgres18.sh --configure-existing --remote     # cluster ya instalado
 # =============================================================================
 set -Eeuo pipefail
 
@@ -78,10 +109,28 @@ OPEN_PGADMIN="${OPEN_PGADMIN:-0}"
 OPEN_PG="${OPEN_PG:-0}"
 EXTRA_PORTS="${EXTRA_PORTS:-}"
 DRY_RUN="${DRY_RUN:-0}"
+REMOTE="${REMOTE:-}"                     # vacio = preguntar
+HBA_TYPE="${HBA_TYPE:-hostssl}"
+BLOCK_PG_REMOTE="${BLOCK_PG_REMOTE:-0}"
+CONFIGURE_EXISTING="${CONFIGURE_EXISTING:-0}"
+TUNE="${TUNE:-}"                         # vacio = solo en cluster nuevo
+MAX_CONN="${MAX_CONN:-100}"
+RAM_MB="${RAM_MB:-}"
+PGSS="${PGSS:-1}"
+APP_USER="${APP_USER:-}"
+APP_DB="${APP_DB:-}"
+APP_PASS="${APP_PASSWORD:-}"
+ENABLE_FW="${ENABLE_FW:-0}"
+PORT_GIVEN=0
 
 PGDATA="/var/lib/pgsql/${PG_VERSION}/data"
 PGBIN="/usr/pgsql-${PG_VERSION}/bin"
 SVC="postgresql-${PG_VERSION}"
+SCRIPT_NAME="install-postgres18.sh"
+PG_CONF_FILE="${PGDATA}/postgresql.conf"
+CONFD="${PGDATA}/conf.d"
+HBA_FILE="${PGDATA}/pg_hba.conf"
+SSL_DIR="${PGDATA}"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 CRED_FILE="/root/.postgres${PG_VERSION}-credentials"
 LOG_FILE="/var/log/install-postgres${PG_VERSION}-${STAMP}.log"
@@ -102,6 +151,7 @@ die()  { echo "${c_err}[x]${c_off} $*" >&2; exit 1; }
 run()  { if [[ "$DRY_RUN" == 1 ]]; then echo "DRY: $*"; else "$@"; fi; }
 have() { command -v "$1" >/dev/null 2>&1; }
 gen_pass() { openssl rand -base64 24 | tr -d '/+=' | cut -c1-20; }
+psql_pg() { runuser -u postgres -- "${PGBIN}/psql" -p "$PG_PORT" "$@"; }
 selinux_on() { have getenforce && [[ "$(getenforce)" != "Disabled" ]]; }
 
 backup() { # respalda un archivo si existe
@@ -121,9 +171,23 @@ usage() {
 # ----------------------------- Argumentos ------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --pg-port) PG_PORT="$2"; shift 2;;
+    --pg-port) PG_PORT="$2"; PORT_GIVEN=1; shift 2;;
     --listen) PG_LISTEN="$2"; shift 2;;
-    --allow-cidr) ALLOW_CIDR="$2"; shift 2;;
+    --remote|--acceso-remoto) REMOTE=1; shift;;
+    --local-only) REMOTE=0; shift;;
+    --allow-cidr|--allow-ip) ALLOW_CIDR="${ALLOW_CIDR:+${ALLOW_CIDR},}$2"; shift 2;;
+    --no-ssl-required) HBA_TYPE=host; shift;;
+    --block-postgres-remote) BLOCK_PG_REMOTE=1; shift;;
+    --configure-existing|--reconfigurar) CONFIGURE_EXISTING=1; shift;;
+    --tune) TUNE=1; shift;;
+    --no-tune) TUNE=0; shift;;
+    --max-connections) MAX_CONN="$2"; shift 2;;
+    --ram-mb) RAM_MB="$2"; shift 2;;
+    --no-pg-stat-statements) PGSS=0; shift;;
+    --app-user) APP_USER="$2"; shift 2;;
+    --app-db) APP_DB="$2"; shift 2;;
+    --app-password) APP_PASS="$2"; shift 2;;
+    --enable-firewall) ENABLE_FW=1; shift;;
     --with-observability) WITH_OBS=1; shift;;
     --with-pgadmin) WITH_PGADMIN=1; shift;;
     --all) WITH_OBS=1; WITH_PGADMIN=1; shift;;
@@ -155,16 +219,71 @@ case "${ID:-}:${VERSION_ID%%.*}" in
 esac
 [[ "$(uname -m)" == "x86_64" || "$(uname -m)" == "aarch64" ]] || die "Arquitectura no soportada."
 
-for p in "$PG_PORT" "$GRAFANA_PORT" "$PROMETHEUS_PORT" "$EXPORTER_PORT" "$PGADMIN_PORT"; do
-  [[ "$p" =~ ^[0-9]+$ && "$p" -ge 1 && "$p" -le 65535 ]] || die "Puerto invalido: $p"
-done
-
-# ----------------------------- Clave de administracion -----------------------
-# Por defecto Jema2026#. Si hay terminal y no se indico --password, se ofrece cambiarla.
+# ----------------------------- Preguntas (puerto y acceso remoto) ------------
 # Se lee del teclado (/dev/tty) para que tambien funcione con: curl ... | sudo bash
 TTY_IN=""
 if [[ -t 0 ]]; then TTY_IN=/dev/stdin
 elif { : < /dev/tty; } 2>/dev/null; then TTY_IN=/dev/tty; fi
+ask() { local __r=""; read -rp "$1" __r < "$TTY_IN" || true; printf '%s' "$__r"; }
+PRE_EXISTS=0; [[ -f "${PGDATA}/PG_VERSION" ]] && PRE_EXISTS=1
+if [[ -z "$REMOTE" && "$PG_LISTEN" != "localhost" ]]; then REMOTE=1; fi
+
+if [[ $NO_PROMPT -eq 0 && -n "$TTY_IN" ]]; then
+  if [[ $PORT_GIVEN -eq 0 && $PRE_EXISTS -eq 0 ]]; then
+    _a="$(ask "Puerto de PostgreSQL [${PG_PORT}]: ")"; [[ -n "$_a" ]] && { PG_PORT="$_a"; PORT_GIVEN=1; }
+  fi
+  if [[ -z "$REMOTE" ]]; then
+    _a="$(ask "¿Permitir conexiones remotas a la base de datos (desde otras PC/servidores)? [s/N]: ")"
+    if [[ "$_a" =~ ^[sSyY] ]]; then REMOTE=1; else REMOTE=0; fi
+  fi
+  if [[ "$REMOTE" == 1 && -z "$ALLOW_CIDR" ]]; then
+    ALLOW_CIDR="$(ask "IPs o redes permitidas, separadas por coma (ej: 190.1.2.3,10.0.0.0/24; Enter = cualquier IP): ")"
+  fi
+  if [[ $PRE_EXISTS -eq 1 && "$CONFIGURE_EXISTING" != 1 && ( "$REMOTE" == 1 || $PORT_GIVEN -eq 1 || "$TUNE" == 1 ) ]]; then
+    _a="$(ask "El cluster ${PG_VERSION}/${PG_CLUSTER} ya existe. ¿Aplicarle estos cambios? Se respalda y se reinicia PostgreSQL [s/N]: ")"
+    [[ "$_a" =~ ^[sSyY] ]] && CONFIGURE_EXISTING=1
+  fi
+  unset _a
+fi
+REMOTE="${REMOTE:-0}"
+
+# ----------------------------- Validaciones ----------------------------------
+for p in "$PG_PORT" "$GRAFANA_PORT" "$PROMETHEUS_PORT" "$EXPORTER_PORT" "$PGADMIN_PORT"; do
+  [[ "$p" =~ ^[0-9]+$ && "$p" -ge 1 && "$p" -le 65535 ]] || die "Puerto invalido: $p"
+done
+[[ "$MAX_CONN" =~ ^[0-9]+$ && "$MAX_CONN" -ge 10 ]] || die "--max-connections invalido: ${MAX_CONN} (minimo 10)"
+[[ -z "$RAM_MB" || "$RAM_MB" =~ ^[0-9]+$ ]] || die "--ram-mb invalido: ${RAM_MB}"
+
+# IPs/redes permitidas: acepta IPv4/IPv6 con o sin mascara (una IP sola = /32 o /128)
+ALLOW_LIST=()
+if [[ -n "$ALLOW_CIDR" ]]; then
+  IFS=', ' read -ra _cl <<< "$ALLOW_CIDR"
+  for c in "${_cl[@]}"; do
+    [[ -z "$c" ]] && continue
+    if [[ "$c" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}(/([0-9]|[12][0-9]|3[0-2]))?$ ]]; then
+      [[ "$c" == */* ]] || c="${c}/32"
+    elif [[ "$c" == *:* && "$c" =~ ^[0-9A-Fa-f:]+(/([0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]))?$ ]]; then
+      [[ "$c" == */* ]] || c="${c}/128"
+    else
+      die "IP o red invalida en --allow-cidr: '${c}' (ej: 190.1.2.3 o 10.0.0.0/24)"
+    fi
+    ALLOW_LIST+=("$c")
+  done
+  unset _cl c
+fi
+if [[ "$REMOTE" == 1 && "$PG_LISTEN" == "localhost" ]]; then PG_LISTEN='*'; fi
+if [[ "$REMOTE" != 1 && "$PG_LISTEN" != "localhost" ]]; then REMOTE=1; fi
+
+if [[ -n "$APP_DB" && -z "$APP_USER" ]]; then APP_USER="$APP_DB"; fi
+if [[ -n "$APP_USER" && -z "$APP_DB" ]]; then APP_DB="$APP_USER"; fi
+for _n in "$APP_USER" "$APP_DB"; do
+  [[ -z "$_n" || "$_n" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] || die "Nombre invalido '${_n}': use minusculas, numeros y _ (ej: erp_app)."
+done
+[[ "$APP_USER" == postgres ]] && die "--app-user no puede ser 'postgres'."
+unset _n
+
+# ----------------------------- Clave de administracion -----------------------
+# Por defecto Jema2026#. Si hay terminal y no se indico --password, se ofrece cambiarla.
 if [[ $PASS_GIVEN -eq 0 && $NO_PROMPT -eq 0 && "$DRY_RUN" != 1 && -n "$TTY_IN" ]]; then
   echo "Clave de administracion (postgres, pgAdmin, Grafana)."
   read -rsp "Escriba otra clave o presione Enter para usar la por defecto (${DEFAULT_PASS}): " _p1 < "$TTY_IN"; echo
@@ -176,6 +295,9 @@ if [[ $PASS_GIVEN -eq 0 && $NO_PROMPT -eq 0 && "$DRY_RUN" != 1 && -n "$TTY_IN" ]
   unset _p1 _p2
 fi
 [[ ${#ADMIN_PASS} -ge 8 ]] || die "La clave debe tener al menos 8 caracteres."
+if [[ "$REMOTE" == 1 && ${#ALLOW_LIST[@]} -eq 0 && $PRE_EXISTS -eq 0 && "$ADMIN_PASS" == "$DEFAULT_PASS" ]]; then
+  die "Acceso remoto desde CUALQUIER IP con la clave por defecto (es publica): indique otra con --password o al preguntar, o limite el origen con --allow-cidr."
+fi
 # pgAdmin rechaza correos con dominios reservados (.local, .localhost, .test, ...): la cuenta no se crearia.
 if [[ "$WITH_PGADMIN" == 1 ]]; then
   [[ "$PGADMIN_EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[A-Za-z]{2,}$ ]] || die "Correo de pgAdmin invalido: ${PGADMIN_EMAIL}"
@@ -184,7 +306,7 @@ if [[ "$WITH_PGADMIN" == 1 ]]; then
       die "pgAdmin no acepta correos terminados en .${PGADMIN_EMAIL##*.} (${PGADMIN_EMAIL}). Use otro, ej: --pgadmin-email admin@example.com";;
   esac
 fi
-if [[ "$ADMIN_PASS" == "$DEFAULT_PASS" && ( "$PG_LISTEN" != "localhost" || "$OPEN_PG" == 1 || "$OPEN_PGADMIN" == 1 || "$OPEN_OBS" == 1 ) ]]; then
+if [[ "$ADMIN_PASS" == "$DEFAULT_PASS" && ( ( $PRE_EXISTS -eq 0 && ( "$REMOTE" == 1 || "$OPEN_PG" == 1 ) ) || "$OPEN_PGADMIN" == 1 || "$OPEN_OBS" == 1 ) ]]; then
   CLAVE_DEFECTO_EXPUESTA=1
 else
   CLAVE_DEFECTO_EXPUESTA=0
@@ -203,13 +325,13 @@ check_port() { # puerto, nombre
     return 1
   fi
 }
-if ! systemctl is-active --quiet "$SVC" 2>/dev/null; then
+if [[ $PRE_EXISTS -eq 0 ]]; then
   if ! check_port "$PG_PORT" "PostgreSQL"; then
     die "Elija otro puerto con --pg-port. No se modifico nada."
   fi
 fi
 
-info "Plan: PG ${PG_VERSION} puerto ${PG_PORT}, listen='${PG_LISTEN}', cidr='${ALLOW_CIDR:-ninguno}', obs=${WITH_OBS}, pgadmin=${WITH_PGADMIN}"
+info "Plan: PG ${PG_VERSION} puerto ${PG_PORT}, remoto=$([[ "$REMOTE" == 1 ]] && echo "si, ${HBA_TYPE} desde ${ALLOW_LIST[*]:-cualquier IP}" || echo no), app=${APP_USER:-no}, obs=${WITH_OBS}, pgadmin=${WITH_PGADMIN}"
 
 # Foto del estado previo (para auditar o revertir a mano si hiciera falta)
 if [[ "$DRY_RUN" != 1 ]]; then
@@ -236,19 +358,284 @@ install_repo() {
 }
 
 # ----------------------------- 2) PostgreSQL ---------------------------------
+# ----------------------------- Configuracion del cluster (comun) -------------
+# Todo lo que se escribe se registra: si PostgreSQL no arranca con la configuracion
+# nueva de un cluster EXISTENTE, se revierte sola (ver restart_or_rollback).
+NEW_FILES=(); CHANGED_FILES=()
+REMOTE_APPLIED=0; CONFIGURED=0; LIVE_PORT=""
+HBA_BEGIN="# BEGIN install-postgres18: acceso remoto (bloque generado; se reemplaza al reconfigurar)"
+HBA_END="# END install-postgres18: acceso remoto"
+
+in_list() { local x="$1"; shift; local y; for y in "$@"; do [[ "$x" == "$y" ]] && return 0; done; return 1; }
+track_file() { # registra un archivo antes de modificarlo (respaldo una sola vez)
+  local f="$1"
+  if in_list "$f" ${NEW_FILES[@]+"${NEW_FILES[@]}"} ${CHANGED_FILES[@]+"${CHANGED_FILES[@]}"}; then return 0; fi
+  if [[ -f "$f" ]]; then backup "$f"; CHANGED_FILES+=("$f"); else NEW_FILES+=("$f"); fi
+}
+write_pg_file() { # ruta ; contenido por stdin
+  local f="$1"
+  track_file "$f"
+  cat > "$f"; chown postgres:postgres "$f"; chmod 640 "$f"
+}
+
+ensure_confd() {
+  install -d -o postgres -g postgres -m 750 "$CONFD"
+  if ! grep -Eq "^\s*include_dir\s*=\s*'conf.d'" "$PG_CONF_FILE"; then
+    track_file "$PG_CONF_FILE"
+    printf "\n# agregado por %s\ninclude_dir = 'conf.d'\n" "$SCRIPT_NAME" >> "$PG_CONF_FILE"
+  fi
+}
+
+write_base_conf() { # solo cluster nuevo: registro de consultas lentas, bloqueos, etc.
+  write_pg_file "${CONFD}/90-install-script.conf" < <(
+    echo "# generado por ${SCRIPT_NAME} ${STAMP}"
+    echo "track_io_timing = on"
+    echo "log_line_prefix = '%m [%p] %q%u@%d '"
+    echo "log_min_duration_statement = 1000"
+    echo "log_checkpoints = on"
+    echo "log_lock_waits = on"
+    if [[ "$PGSS" == 1 ]]; then
+      echo "shared_preload_libraries = 'pg_stat_statements'"
+      echo "pg_stat_statements.track = all"
+    fi
+  )
+}
+
+write_tuning_conf() { # memoria y paralelismo segun la RAM y los CPU del servidor
+  local ram cpus sb ecs mwm wm par
+  ram="${RAM_MB:-$(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo)}"
+  cpus="$(nproc 2>/dev/null || echo 1)"
+  sb=$(( ram / 4 ));        (( sb < 128 )) && sb=128
+  ecs=$(( ram * 3 / 4 ))
+  mwm=$(( ram / 16 ));      (( mwm < 64 )) && mwm=64; (( mwm > 2048 )) && mwm=2048
+  wm=$(( (ram - sb) / (MAX_CONN * 3) )); (( wm < 4 )) && wm=4; (( wm > 256 )) && wm=256
+  par=$(( cpus / 2 ));      (( par > 4 )) && par=4
+  info "Rendimiento: RAM ${ram} MB, ${cpus} CPU -> shared_buffers ${sb}MB, work_mem ${wm}MB, max_connections ${MAX_CONN}"
+  write_pg_file "${CONFD}/80-rendimiento.conf" < <(
+    echo "# generado por ${SCRIPT_NAME} ${STAMP} para RAM=${ram}MB CPU=${cpus}"
+    echo "# (para recalcular: vuelva a ejecutar el instalador con --configure-existing --tune)"
+    echo "max_connections = ${MAX_CONN}"
+    echo "shared_buffers = ${sb}MB"
+    echo "effective_cache_size = ${ecs}MB"
+    echo "maintenance_work_mem = ${mwm}MB"
+    echo "work_mem = ${wm}MB"
+    echo "wal_buffers = 16MB"
+    echo "checkpoint_completion_target = 0.9"
+    echo "min_wal_size = 512MB"
+    echo "max_wal_size = 2GB"
+    echo "default_statistics_target = 100"
+    echo "# discos SSD/NVMe (lo habitual en VPS)"
+    echo "random_page_cost = 1.1"
+    echo "effective_io_concurrency = 200"
+    if (( cpus >= 2 )); then
+      echo "max_worker_processes = ${cpus}"
+      echo "max_parallel_workers = ${cpus}"
+      echo "max_parallel_workers_per_gather = ${par}"
+      echo "max_parallel_maintenance_workers = ${par}"
+    fi
+  )
+}
+
+write_listen_conf() {
+  write_pg_file "${CONFD}/91-escucha.conf" < <(
+    echo "# generado por ${SCRIPT_NAME} ${STAMP}"
+    echo "listen_addresses = '${PG_LISTEN}'"
+  )
+  if grep -qsE "^\s*listen_addresses" "${PGDATA}/postgresql.auto.conf"; then
+    warn "postgresql.auto.conf (ALTER SYSTEM) define listen_addresses y tiene prioridad sobre conf.d: reviselo."
+  fi
+}
+
+ssl_on_in_config() {
+  grep -hsE "^\s*ssl\s*=\s*'?(on|true|yes|1)'?\s*(#.*)?$" "$PG_CONF_FILE" "$CONFD"/*.conf "${PGDATA}/postgresql.auto.conf" | grep -q .
+}
+ensure_ssl() { # 'hostssl' exige SSL en el servidor; si no esta activo se crea un certificado autofirmado
+  [[ "$HBA_TYPE" == hostssl ]] || return 0
+  ssl_on_in_config && return 0
+  local crt="${SSL_DIR}/server-install.crt" key="${SSL_DIR}/server-install.key" cn
+  cn="$(hostname -f 2>/dev/null || hostname)"
+  info "Activando SSL con certificado autofirmado (CN=${cn}, 10 anios)..."
+  openssl req -new -x509 -days 3650 -nodes -newkey rsa:2048 -subj "/CN=${cn}" \
+    -keyout "$key" -out "$crt" >/dev/null 2>&1 || die "No se pudo generar el certificado SSL."
+  chown postgres:postgres "$crt" "$key"; chmod 600 "$key"; chmod 644 "$crt"
+  write_pg_file "${CONFD}/92-ssl.conf" < <(
+    echo "# generado por ${SCRIPT_NAME} ${STAMP}"
+    echo "ssl = on"
+    echo "ssl_cert_file = '${crt}'"
+    echo "ssl_key_file = '${key}'"
+  )
+}
+
+write_hba_block() { # bloque propio al final de pg_hba.conf (las reglas locales siguen primero)
+  local -a src=(${ALLOW_LIST[@]+"${ALLOW_LIST[@]}"}); local c tmp
+  (( ${#src[@]} )) || src=("0.0.0.0/0" "::/0")
+  track_file "$HBA_FILE"
+  tmp="$(mktemp)"
+  awk -v b="$HBA_BEGIN" -v e="$HBA_END" '$0==b {skip=1} !skip {print} $0==e {skip=0}' "$HBA_FILE" > "$tmp"
+  {
+    echo "$HBA_BEGIN"
+    if [[ "$BLOCK_PG_REMOTE" == 1 ]]; then
+      echo "# el superusuario 'postgres' solo puede entrar desde este servidor"
+      for c in "${src[@]}"; do printf "%-8s %-6s %-10s %-43s %s\n" host all postgres "$c" reject; done
+    fi
+    for c in "${src[@]}"; do printf "%-8s %-6s %-10s %-43s %s\n" "$HBA_TYPE" all all "$c" scram-sha-256; done
+    echo "$HBA_END"
+  } >> "$tmp"
+  cat "$tmp" > "$HBA_FILE"; rm -f "$tmp"
+  info "pg_hba.conf: ${HBA_TYPE} desde ${src[*]}"
+}
+
+configure_cluster() { # $1 = 1 si el cluster es nuevo. Devuelve 0 si escribio configuracion.
+  local fresh="$1" port_change=0
+  if [[ $fresh -eq 0 && -n "$LIVE_PORT" && $PORT_GIVEN -eq 1 && "$PG_PORT" != "$LIVE_PORT" ]]; then port_change=1; fi
+
+  if [[ $fresh -eq 0 && "$CONFIGURE_EXISTING" != 1 ]]; then
+    if [[ -n "$LIVE_PORT" ]]; then
+      [[ "$LIVE_PORT" != "$PG_PORT" ]] && warn "El cluster existente usa el puerto ${LIVE_PORT}; se usa ese y no ${PG_PORT}."
+      PG_PORT="$LIVE_PORT"
+    fi
+    if [[ "$REMOTE" == 1 || $port_change -eq 1 || "$TUNE" == 1 ]]; then
+      warn "Cluster existente: NO se aplicaron acceso remoto / puerto / rendimiento."
+      warn "Para aplicarlos repita con --configure-existing (respalda, reinicia PostgreSQL y revierte si no arranca)."
+    fi
+    return 1
+  fi
+  [[ $fresh -eq 0 && -n "$LIVE_PORT" && $port_change -eq 0 ]] && PG_PORT="$LIVE_PORT"
+  if [[ $port_change -eq 1 ]] && port_in_use "$PG_PORT"; then
+    die "El puerto ${PG_PORT} ya esta en uso; el cluster sigue en ${LIVE_PORT}. No se modifico nada."
+  fi
+
+  local do_tune=0
+  if [[ "$TUNE" == 1 || ( -z "$TUNE" && $fresh -eq 1 ) ]]; then do_tune=1; fi
+
+  if [[ "$DRY_RUN" == 1 ]]; then
+    echo "DRY: configurar cluster: nuevo=${fresh} puerto=${PG_PORT} cambio_puerto=${port_change} rendimiento=${do_tune} remoto=${REMOTE} (${HBA_TYPE} desde ${ALLOW_LIST[*]:-cualquier IP})"
+    [[ "$REMOTE" == 1 ]] && REMOTE_APPLIED=1
+    return 0
+  fi
+
+  ensure_confd
+  if [[ $fresh -eq 1 ]]; then write_base_conf; fi
+  if [[ $do_tune -eq 1 ]]; then write_tuning_conf; fi
+  if [[ $fresh -eq 1 || $port_change -eq 1 ]]; then set_pg_port "$fresh"; fi
+  if [[ "$REMOTE" == 1 ]]; then
+    write_listen_conf
+    ensure_ssl
+    write_hba_block
+    REMOTE_APPLIED=1
+  elif [[ $fresh -eq 1 ]]; then
+    write_listen_conf   # localhost
+  fi
+  (( ${#NEW_FILES[@]} + ${#CHANGED_FILES[@]} )) || return 1
+  return 0
+}
+
+restart_or_rollback() {
+  info "Reiniciando ${SVC} para aplicar la configuracion (corta las conexiones unos segundos)..."
+  if systemctl restart "$SVC" && sleep 2 && systemctl is-active --quiet "$SVC"; then
+    info "${SVC} reiniciado con la configuracion nueva."; return 0
+  fi
+  warn "PostgreSQL NO arranco con la configuracion nueva: revirtiendo los cambios..."
+  local f
+  for f in ${NEW_FILES[@]+"${NEW_FILES[@]}"}; do [[ -e "$f" ]] && mv -f "$f" "${f}.fallido-${STAMP}"; done
+  for f in ${CHANGED_FILES[@]+"${CHANGED_FILES[@]}"}; do cp -a "${f}.bak-${STAMP}" "$f"; done
+  systemctl restart "$SVC" || true
+  die "Cambios revertidos y PostgreSQL reiniciado con la configuracion anterior. Detalle: journalctl -u ${SVC} -n 50"
+}
+
+start_cluster() { # $1 = 1 si el cluster es nuevo
+  local fresh="$1"
+  if [[ $fresh -eq 1 ]]; then
+    enable_pg_service
+    run systemctl start "$SVC" || die "No arranco ${SVC}. Detalle: journalctl -u ${SVC} -n 50"
+  elif ! systemctl is-active --quiet "$SVC" 2>/dev/null; then
+    warn "El cluster existente en ${PGDATA} no esta activo: NO se inicia (puede ser de otro sistema)."
+    [[ $CONFIGURED -eq 1 ]] && warn "La configuracion nueva se aplicara cuando lo inicie."
+    PG_UP=0
+  elif [[ $CONFIGURED -eq 1 ]]; then
+    if [[ "$DRY_RUN" == 1 ]]; then echo "DRY: systemctl restart ${SVC}"; else restart_or_rollback; fi
+  else
+    info "Servicio ${SVC} ya activo: no se reinicia ni se recarga."
+  fi
+}
+
+set_credentials() { # solo cluster nuevo
+  [[ "$1" -eq 1 && "$DRY_RUN" != 1 ]] || return 0
+  local pw_sql="${ADMIN_PASS//\'/\'\'}"
+  psql_pg -qc "ALTER ROLE postgres PASSWORD '${pw_sql}'"
+  if [[ "$PGSS" == 1 ]]; then psql_pg -qc "CREATE EXTENSION IF NOT EXISTS pg_stat_statements" || true; fi
+  ( umask 077; { echo "# generado ${STAMP}"; echo "POSTGRES_PASSWORD=${ADMIN_PASS}"; } >> "$CRED_FILE" )
+  info "Password de 'postgres' guardado en ${CRED_FILE}"
+}
+
+create_app() { # usuario y base propios para la aplicacion (no usar 'postgres' desde fuera)
+  [[ -n "$APP_USER" ]] || return 0
+  if [[ "$PG_UP" != 1 ]]; then warn "Cluster inactivo: no se creo el usuario/base de la aplicacion."; return 0; fi
+  if [[ "$DRY_RUN" == 1 ]]; then echo "DRY: crear rol ${APP_USER} y base ${APP_DB} (dueno ${APP_USER})"; return 0; fi
+  local gen=0 pw_sql
+  if [[ -z "$APP_PASS" ]]; then APP_PASS="$(gen_pass)"; gen=1; fi
+  pw_sql="${APP_PASS//\'/\'\'}"
+  if [[ "$(psql_pg -tAc "SELECT 1 FROM pg_roles WHERE rolname='${APP_USER}'")" == 1 ]]; then
+    if [[ $gen -eq 1 ]]; then
+      info "El rol ${APP_USER} ya existe: se conserva su clave (use --app-password para cambiarla)."; APP_PASS=""
+    else
+      psql_pg -qc "ALTER ROLE \"${APP_USER}\" PASSWORD '${pw_sql}'"; info "Clave del rol ${APP_USER} actualizada."
+    fi
+  else
+    psql_pg -qc "CREATE ROLE \"${APP_USER}\" LOGIN PASSWORD '${pw_sql}'"
+    info "Rol ${APP_USER} creado."
+  fi
+  if [[ "$(psql_pg -tAc "SELECT 1 FROM pg_database WHERE datname='${APP_DB}'")" == 1 ]]; then
+    warn "La base ${APP_DB} ya existe: no se modifica (dueno y permisos se mantienen)."
+  else
+    psql_pg -qc "CREATE DATABASE \"${APP_DB}\" OWNER \"${APP_USER}\" ENCODING 'UTF8' TEMPLATE template0"
+    info "Base ${APP_DB} creada (dueno ${APP_USER})."
+  fi
+  if [[ -n "$APP_PASS" ]]; then
+    ( umask 077; { echo "APP_USER=${APP_USER}"; echo "APP_DB=${APP_DB}"; echo "APP_PASSWORD=${APP_PASS}"; } >> "$CRED_FILE" )
+  fi
+}
+
+ssh_ports() { # puertos de SSH (para no cortarse al activar el firewall)
+  local ps
+  ps="$( { sshd -T 2>/dev/null | awk '$1=="port" {print $2}'
+           ss -H -ltnp 2>/dev/null | awk '/"sshd"/ {n=split($4,a,":"); print a[n]}'; } | sort -un)"
+  echo "${ps:-22}"
+}
+
+# --- particular de CentOS/RHEL ---
+PORT_IN_CONFD=1   # el puerto va en conf.d/91-puerto.conf
+selinux_pg_port() {
+  if [[ "$PG_PORT" != "5432" ]] && selinux_on; then
+    run semanage port -a -t postgresql_port_t -p tcp "$PG_PORT" 2>/dev/null \
+      || run semanage port -m -t postgresql_port_t -p tcp "$PG_PORT" || true
+  fi
+}
+set_pg_port() { # $1 = 1 si el cluster es nuevo
+  write_pg_file "${CONFD}/91-puerto.conf" < <(
+    echo "# generado por ${SCRIPT_NAME} ${STAMP}"
+    echo "port = ${PG_PORT}"
+  )
+  selinux_pg_port
+  [[ "$1" -eq 1 ]] || info "Puerto del cluster: ${LIVE_PORT} -> ${PG_PORT}"
+}
+enable_pg_service() { run systemctl enable "$SVC"; }
+
 install_postgres() {
+  local fresh=0
   info "Instalando paquetes PostgreSQL ${PG_VERSION}..."
   run dnf install -y "postgresql${PG_VERSION}-server" "postgresql${PG_VERSION}" \
                      "postgresql${PG_VERSION}-contrib" openssl policycoreutils-python-utils
 
-  local fresh=0
-  if [[ -f "${PGDATA}/PG_VERSION" ]]; then
+  if [[ $PRE_EXISTS -eq 1 ]]; then
     warn "Ya existe un cluster en ${PGDATA}: NO se ejecuta initdb (datos intactos)."
-    warn "Cluster existente: NO se tocan su postgresql.conf, pg_hba.conf ni su servicio (puede ser de otro sistema)."
-    local live; live="$(sed -n '4p' "${PGDATA}/postmaster.pid" 2>/dev/null || true)"
-    if [[ "$live" =~ ^[0-9]+$ ]]; then
-      if [[ "$live" != "$PG_PORT" ]]; then warn "El cluster existente escucha en el puerto ${live}; se usa ese y no ${PG_PORT}."; fi
-      PG_PORT="$live"
+    LIVE_PORT="$(sed -n '4p' "${PGDATA}/postmaster.pid" 2>/dev/null || true)"
+    if ! [[ "$LIVE_PORT" =~ ^[0-9]+$ ]]; then
+      LIVE_PORT="$(runuser -u postgres -- "${PGBIN}/postgres" -C port -D "$PGDATA" 2>/dev/null || true)"
+    fi
+    [[ "$LIVE_PORT" =~ ^[0-9]+$ ]] || LIVE_PORT=""
+    if [[ "$CONFIGURE_EXISTING" != 1 ]]; then
+      warn "Cluster existente: NO se tocan su configuracion ni su servicio (use --configure-existing para cambiarlos)."
     fi
   else
     fresh=1
@@ -257,80 +644,37 @@ install_postgres() {
       run "${PGBIN}/postgresql-${PG_VERSION}-setup" initdb
   fi
 
-  # --- configuracion modular via conf.d (solo cluster nuevo) ---
-  local conf="${PGDATA}/postgresql.conf" confd="${PGDATA}/conf.d"
-  if [[ "$DRY_RUN" != 1 && $fresh -eq 1 ]]; then
-    install -d -o postgres -g postgres -m 700 "$confd"
-    if ! grep -Eq "^\s*include_dir\s*=\s*'conf.d'" "$conf"; then
-      backup "$conf"
-      printf "\n# agregado por install-postgres18.sh\ninclude_dir = 'conf.d'\n" >> "$conf"
-    fi
-    local mine="${confd}/90-install-script.conf"
-    {
-      echo "# generado por install-postgres18.sh ${STAMP}"
-      echo "port = ${PG_PORT}"
-      echo "listen_addresses = '${PG_LISTEN}'"
-      echo "track_io_timing = on"
-      echo "log_line_prefix = '%m [%p] %q%u@%d '"
-      echo "log_min_duration_statement = 1000"
-      echo "log_checkpoints = on"
-      echo "log_lock_waits = on"
-      echo "shared_preload_libraries = 'pg_stat_statements'"
-      echo "pg_stat_statements.track = all"
-    } > "$mine"
-    chown postgres:postgres "$mine"; chmod 600 "$mine"
-  fi
-
-  # --- acceso remoto en pg_hba (solo cluster nuevo y solo si se definio CIDR) ---
-  if [[ -n "$ALLOW_CIDR" && "$DRY_RUN" != 1 && $fresh -eq 1 ]]; then
-    local hba="${PGDATA}/pg_hba.conf"
-    if ! grep -q "install-postgres18.sh ${ALLOW_CIDR}" "$hba"; then
-      backup "$hba"
-      printf "\n# install-postgres18.sh %s\nhost    all    all    %s    scram-sha-256\n" "$ALLOW_CIDR" "$ALLOW_CIDR" >> "$hba"
-    fi
-  elif [[ "$PG_LISTEN" != "localhost" && -z "$ALLOW_CIDR" && $fresh -eq 1 ]]; then
-    warn "Escucha en '${PG_LISTEN}' sin --allow-cidr: pg_hba no se modifico, solo conexiones locales hasta que agregue una regla."
-  fi
-
-  # --- SELinux: puerto no estandar (solo cluster nuevo) ---
-  if [[ "$PG_PORT" != "5432" && $fresh -eq 1 ]] && selinux_on; then
-    run semanage port -a -t postgresql_port_t -p tcp "$PG_PORT" 2>/dev/null \
-      || run semanage port -m -t postgresql_port_t -p tcp "$PG_PORT" || true
-  fi
-
-  # --- servicio ---
-  if [[ $fresh -eq 1 ]]; then
-    run systemctl enable "$SVC"
-    run systemctl start "$SVC"
-  elif systemctl is-active --quiet "$SVC"; then
-    info "Servicio ${SVC} ya activo: no se reinicia ni se recarga."
-  else
-    warn "El cluster existente en ${PGDATA} no esta activo: NO se inicia (puede ser de otro sistema). La observabilidad se omitira."
-    PG_UP=0
-  fi
-
-  # --- credenciales (solo cluster nuevo) ---
-  if [[ $fresh -eq 1 && "$DRY_RUN" != 1 ]]; then
-    local pw="$ADMIN_PASS" pw_sql="${ADMIN_PASS//\'/\'\'}"
-    sudo -u postgres "${PGBIN}/psql" -p "$PG_PORT" -qc "ALTER ROLE postgres PASSWORD '${pw_sql}'"
-    sudo -u postgres "${PGBIN}/psql" -p "$PG_PORT" -qc "CREATE EXTENSION IF NOT EXISTS pg_stat_statements" || true
-    ( umask 077; { echo "# generado ${STAMP}"; echo "POSTGRES_PASSWORD=${pw}"; } >> "$CRED_FILE" )
-    info "Password de 'postgres' guardado en ${CRED_FILE}"
-  fi
+  if configure_cluster "$fresh"; then CONFIGURED=1; fi
+  start_cluster "$fresh"
+  set_credentials "$fresh"
 }
 
 # ----------------------------- 3) Firewall -----------------------------------
-fw_open() { # puerto
-  local port="$1"
+fw_enable() { # solo con --enable-firewall; permite SSH ANTES de activar
+  [[ "$ENABLE_FW" == 1 ]] || return 0
+  if systemctl is-active --quiet firewalld; then info "firewalld ya activo."; return 0; fi
+  run dnf install -y firewalld
+  local p
+  run firewall-offline-cmd --add-service=ssh || true
+  for p in $(ssh_ports); do run firewall-offline-cmd --add-port="${p}/tcp" || true; done
+  run systemctl enable --now firewalld
+  info "firewalld activado (SSH permitido en: $(ssh_ports | tr '\n' ' '))."
+}
+fw_open() { # puerto ; origen = ALLOW_LIST (vacia = cualquiera)
+  local port="$1" c fam
+  local -a src=(${ALLOW_LIST[@]+"${ALLOW_LIST[@]}"})
   if ! systemctl is-active --quiet firewalld; then
-    warn "firewalld inactivo: no se abre ${port}/tcp (revise su firewall)."; return 0
+    warn "firewalld inactivo: no se agrego regla para ${port}/tcp (queda accesible si no hay otro firewall). Use --enable-firewall para activarlo."
+    return 0
   fi
-  if [[ -n "$ALLOW_CIDR" ]]; then
-    run firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=${ALLOW_CIDR} port port=${port} protocol=tcp accept"
+  if (( ${#src[@]} == 0 )); then run firewall-cmd --permanent --add-port="${port}/tcp"
   else
-    run firewall-cmd --permanent --add-port="${port}/tcp"
+    for c in "${src[@]}"; do
+      fam=ipv4; [[ "$c" == *:* ]] && fam=ipv6
+      run firewall-cmd --permanent --add-rich-rule="rule family=${fam} source address=${c} port port=${port} protocol=tcp accept"
+    done
   fi
-  FW_CHANGED=1; info "Firewall: abierto ${port}/tcp ${ALLOW_CIDR:+(origen ${ALLOW_CIDR})}"
+  FW_CHANGED=1; info "Firewall: abierto ${port}/tcp desde ${src[*]:-cualquier IP}"
 }
 fw_reload() { if [[ $FW_CHANGED -eq 1 ]]; then run firewall-cmd --reload; fi; }
 
@@ -588,7 +932,12 @@ install_pgadmin() {
   local created_listen=0
   if [[ "$PGADMIN_PORT" != "80" && "$DRY_RUN" != 1 ]]; then
     if ! grep -rqs "^Listen ${PGADMIN_PORT}\$" /etc/httpd/conf.d /etc/httpd/conf 2>/dev/null; then
-      echo "Listen ${PGADMIN_PORT}" > /etc/httpd/conf.d/00-pgadmin-port.conf
+      cat > /etc/httpd/conf.d/00-pgadmin-port.conf <<EOF
+Listen ${PGADMIN_PORT}
+<If "%{SERVER_PORT} == '${PGADMIN_PORT}' && %{REQUEST_URI} == '/'">
+    Redirect "/pgadmin4/"
+</If>
+EOF
       created_listen=1
     fi
     if selinux_on; then semanage port -a -t http_port_t -p tcp "$PGADMIN_PORT" 2>/dev/null || true; fi
@@ -616,8 +965,10 @@ install_pgadmin() {
 
 # ----------------------------- Ejecucion -------------------------------------
 install_repo
+fw_enable
 install_postgres
-if [[ "$PG_LISTEN" != "localhost" || "$OPEN_PG" == 1 ]]; then fw_open "$PG_PORT"; fi
+create_app
+if [[ $REMOTE_APPLIED -eq 1 || "$OPEN_PG" == 1 ]]; then fw_open "$PG_PORT"; fi
 if [[ "$WITH_OBS" == 1 ]]; then
   if [[ "$PG_UP" == 1 ]]; then install_observability; else warn "Observabilidad omitida: el cluster no esta activo."; fi
 fi
@@ -633,9 +984,19 @@ fw_reload
 
 echo
 info "================== RESUMEN =================="
-info "PostgreSQL ${PG_VERSION}: puerto ${PG_PORT}, datos en ${PGDATA}, servicio ${SVC}"
+info "PostgreSQL ${PG_VERSION}: puerto ${PG_PORT}, datos en ${PGDATA} (ajustes propios en conf.d/), servicio ${SVC}"
+SUMMARY_PSQL="sudo -u postgres ${PGBIN}/psql -p ${PG_PORT}"
 if [[ -f "$CRED_FILE" ]]; then info "Credenciales: ${CRED_FILE} (solo root)"; fi
-info "Conexion local: sudo -u postgres ${PGBIN}/psql -p ${PG_PORT}"
+info "Conexion local: ${SUMMARY_PSQL}"
+if [[ $REMOTE_APPLIED -eq 1 ]]; then
+  SERVER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+  info "Acceso remoto: SI (${HBA_TYPE}) desde ${ALLOW_LIST[*]:-CUALQUIER IP}"
+  info "Desde otra PC: host=${SERVER_IP:-IP_DEL_SERVIDOR} port=${PG_PORT} dbname=${APP_DB:-postgres} user=${APP_USER:-postgres} sslmode=$([[ "$HBA_TYPE" == hostssl ]] && echo require || echo prefer)"
+  [[ -z "$APP_USER" ]] && warn "Recomendado: un usuario propio para la aplicacion (--app-user) y --block-postgres-remote."
+  warn "Si su proveedor de VPS tiene un firewall propio (panel web), abra tambien alli el puerto ${PG_PORT}."
+elif [[ $PRE_EXISTS -eq 0 || $CONFIGURED -eq 1 ]]; then
+  info "Acceso remoto: NO (solo desde este servidor). Para activarlo: --configure-existing --remote"
+fi
 if [[ "$DRY_RUN" == 1 ]]; then
   warn "SIMULACION (--dry-run): no se instalo ni se cambio nada. Quite --dry-run para instalar."
 else
