@@ -36,17 +36,22 @@
 #                          Sin lista, --remote permite CUALQUIER IP (exige una clave propia).
 #                          Tambien limita el origen de los puertos que se abren (pgAdmin, Grafana)
 #   --no-ssl-required      Acepta conexiones remotas sin cifrar (pg_hba 'host' en vez de 'hostssl')
-#   --block-postgres-remote  El superusuario 'postgres' solo entra desde este servidor (recomendado
-#                          junto con --app-user)
+#   --block-postgres-remote  El superusuario 'postgres' solo entra desde este servidor (la aplicacion
+#                          usa el usuario 'jema')
 #   --listen DIRS          listen_addresses explicito (def: localhost; distinto de localhost = --remote)
 #   --local-only           Solo conexiones desde este servidor (no pregunta)
 #   --configure-existing   Aplica puerto / acceso remoto / rendimiento a un cluster que YA existe:
 #                          respalda, reinicia PostgreSQL y revierte solo si no arranca
 #
-#  Usuario y base de la aplicacion
-#   --app-user NOMBRE      Crea un rol con login para la aplicacion (ej: erp_app)
-#   --app-db NOMBRE        Crea la base con ese rol como dueno (def: igual al usuario)
-#   --app-password CLAVE   Clave del rol (def: generada; tambien variable APP_PASSWORD)
+#  Usuario y bases de la aplicacion (siempre en minusculas)
+#   --app-user NOMBRE      Usuario con login para la aplicacion (def: jema)
+#   --app-db LISTA         Bases del usuario, separadas por coma (def: jema; se pregunta).
+#                          Si no existe se crea con el usuario como dueno; si YA existe se le dan
+#                          permisos completos (tablas, secuencias, funciones y las futuras)
+#   --app-owner            En bases existentes, ademas traspasa al usuario la propiedad de la base
+#                          y de sus objetos (para que la aplicacion pueda hacer ALTER TABLE, etc.)
+#   --app-password CLAVE   Clave del usuario (def: la clave de administracion; variable APP_PASSWORD)
+#   --no-app-user          No crea el usuario de la aplicacion
 #
 #  Rendimiento
 #   --tune / --no-tune     Ajusta memoria y paralelismo segun RAM y CPU (def: si, en cluster nuevo)
@@ -85,7 +90,7 @@
 #
 # EJEMPLOS:
 #   sudo bash install-postgres18-ubuntu.sh --pg-port 5433 --remote --allow-cidr 190.1.2.3 \
-#        --app-user erp_app --app-db erp_db --block-postgres-remote
+#        --app-db erp_db_biovenezuela --app-owner --block-postgres-remote
 #   sudo bash install-postgres18-ubuntu.sh --configure-existing --remote     # cluster ya instalado
 # =============================================================================
 set -Eeuo pipefail
@@ -122,9 +127,11 @@ TUNE="${TUNE:-}"                         # vacio = solo en cluster nuevo
 MAX_CONN="${MAX_CONN:-100}"
 RAM_MB="${RAM_MB:-}"
 PGSS="${PGSS:-1}"
-APP_USER="${APP_USER:-}"
-APP_DB="${APP_DB:-}"
-APP_PASS="${APP_PASSWORD:-}"
+APP_USER="${APP_USER-jema}"             # vacio = no crear (--no-app-user)
+APP_DB="${APP_DB:-}"                     # vacio = preguntar (def: jema)
+APP_PASS="${APP_PASSWORD:-}"            # vacio = la clave de administracion
+APP_PASS_GIVEN=0; [[ -n "$APP_PASS" ]] && APP_PASS_GIVEN=1
+APP_OWNER="${APP_OWNER:-}"
 ENABLE_FW="${ENABLE_FW:-0}"
 PORT_GIVEN=0
 
@@ -170,6 +177,7 @@ backup() { # respalda un archivo si existe
   return 0
 }
 
+in_list() { local x="$1"; shift; local y; for y in "$@"; do [[ "$x" == "$y" ]] && return 0; done; return 1; }
 port_in_use() { ss -H -ltn "sport = :$1" 2>/dev/null | grep -q .; }
 
 usage() {
@@ -222,7 +230,9 @@ while [[ $# -gt 0 ]]; do
     --no-pg-stat-statements) PGSS=0; shift;;
     --app-user) APP_USER="$2"; shift 2;;
     --app-db) APP_DB="$2"; shift 2;;
-    --app-password) APP_PASS="$2"; shift 2;;
+    --app-password) APP_PASS="$2"; APP_PASS_GIVEN=1; shift 2;;
+    --app-owner) APP_OWNER=1; shift;;
+    --no-app-user) APP_USER=""; shift;;
     --enable-firewall) ENABLE_FW=1; shift;;
     --locale) PG_LOCALE="$2"; shift 2;;
     --with-observability) WITH_OBS=1; shift;;
@@ -290,6 +300,9 @@ if [[ $NO_PROMPT -eq 0 && -n "$TTY_IN" ]]; then
   if [[ "$REMOTE" == 1 && -z "$ALLOW_CIDR" ]]; then
     ALLOW_CIDR="$(ask "IPs o redes permitidas, separadas por coma (ej: 190.1.2.3,10.0.0.0/24; Enter = cualquier IP): ")"
   fi
+  if [[ -n "$APP_USER" && -z "$APP_DB" ]]; then
+    APP_DB="$(ask "Base(s) de datos del usuario ${APP_USER,,}, separadas por coma (si ya existe se le dan permisos) [jema]: ")"
+  fi
   if [[ $PRE_EXISTS -eq 1 && "$CONFIGURE_EXISTING" != 1 && ( "$REMOTE" == 1 || $PORT_GIVEN -eq 1 || "$TUNE" == 1 ) ]]; then
     _a="$(ask "El cluster ${PG_VERSION}/${PG_CLUSTER} ya existe. ¿Aplicarle estos cambios? Se respalda y se reinicia PostgreSQL [s/N]: ")"
     [[ "$_a" =~ ^[sSyY] ]] && CONFIGURE_EXISTING=1
@@ -325,17 +338,31 @@ fi
 if [[ "$REMOTE" == 1 && "$PG_LISTEN" == "localhost" ]]; then PG_LISTEN='*'; fi
 if [[ "$REMOTE" != 1 && "$PG_LISTEN" != "localhost" ]]; then REMOTE=1; fi
 
-if [[ -n "$APP_DB" && -z "$APP_USER" ]]; then APP_USER="$APP_DB"; fi
-if [[ -n "$APP_USER" && -z "$APP_DB" ]]; then APP_DB="$APP_USER"; fi
-for _n in "$APP_USER" "$APP_DB"; do
-  [[ -z "$_n" || "$_n" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] || die "Nombre invalido '${_n}': use minusculas, numeros y _ (ej: erp_app)."
-done
-[[ "$APP_USER" == postgres ]] && die "--app-user no puede ser 'postgres'."
-unset _n
+# Usuario y bases de la aplicacion: siempre en minusculas (PostgreSQL distingue "JEMA" de jema)
+APP_DBS=()
+if [[ -n "$APP_USER" ]]; then
+  [[ "$APP_USER" != "${APP_USER,,}" ]] && warn "Usuario '${APP_USER}' pasado a minusculas: ${APP_USER,,}"
+  APP_USER="${APP_USER,,}"
+  [[ "$APP_USER" == postgres ]] && die "--app-user no puede ser 'postgres'."
+  IFS=', ' read -ra _dl <<< "${APP_DB:-jema}"
+  for _n in "${_dl[@]}"; do
+    [[ -z "$_n" ]] && continue
+    [[ "$_n" != "${_n,,}" ]] && warn "Base '${_n}' pasada a minusculas: ${_n,,}"
+    _n="${_n,,}"
+    [[ "$_n" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] || die "Nombre de base invalido '${_n}': use letras, numeros y _ (ej: erp_db)."
+    in_list "$_n" ${APP_DBS[@]+"${APP_DBS[@]}"} || APP_DBS+=("$_n")
+  done
+  (( ${#APP_DBS[@]} )) || APP_DBS=(jema)
+  for _n in "$APP_USER"; do
+    [[ "$_n" =~ ^[a-z_][a-z0-9_]{0,62}$ ]] || die "Usuario invalido '${_n}': use letras, numeros y _ (ej: jema)."
+  done
+  APP_DB="${APP_DBS[0]}"
+  unset _dl _n
+fi
 
 # ----------------------------- Clave de administracion -----------------------
 if [[ $PASS_GIVEN -eq 0 && $NO_PROMPT -eq 0 && "$DRY_RUN" != 1 && -n "$TTY_IN" ]]; then
-  echo "Clave de administracion (postgres, pgAdmin, Grafana)."
+  echo "Clave de administracion (postgres${APP_USER:+, ${APP_USER}}, pgAdmin, Grafana)."
   read -rsp "Escriba otra clave o presione Enter para usar la por defecto (${DEFAULT_PASS}): " _p1 < "$TTY_IN"; echo
   if [[ -n "$_p1" ]]; then
     read -rsp "Repita la clave: " _p2 < "$TTY_IN"; echo
@@ -345,6 +372,7 @@ if [[ $PASS_GIVEN -eq 0 && $NO_PROMPT -eq 0 && "$DRY_RUN" != 1 && -n "$TTY_IN" ]
   unset _p1 _p2
 fi
 [[ ${#ADMIN_PASS} -ge 8 ]] || die "La clave debe tener al menos 8 caracteres."
+[[ -n "$APP_PASS" ]] || APP_PASS="$ADMIN_PASS"
 if [[ "$REMOTE" == 1 && ${#ALLOW_LIST[@]} -eq 0 && $PRE_EXISTS -eq 0 && "$ADMIN_PASS" == "$DEFAULT_PASS" ]]; then
   die "Acceso remoto desde CUALQUIER IP con la clave por defecto (es publica): indique otra con --password o al preguntar, o limite el origen con --allow-cidr."
 fi
@@ -381,7 +409,7 @@ if [[ ! -f "${PGDATA}/PG_VERSION" ]]; then
   fi
 fi
 
-info "Plan: PG ${PG_VERSION} (${CODENAME}) puerto ${PG_PORT}, remoto=$([[ "$REMOTE" == 1 ]] && echo "si, ${HBA_TYPE} desde ${ALLOW_LIST[*]:-cualquier IP}" || echo no), locale=${PG_LOCALE}, app=${APP_USER:-no}, obs=${WITH_OBS}, pgadmin=${WITH_PGADMIN}"
+info "Plan: PG ${PG_VERSION} (${CODENAME}) puerto ${PG_PORT}, remoto=$([[ "$REMOTE" == 1 ]] && echo "si, ${HBA_TYPE} desde ${ALLOW_LIST[*]:-cualquier IP}" || echo no), locale=${PG_LOCALE}, app=$([[ -n "$APP_USER" ]] && echo "${APP_USER} (${APP_DBS[*]})" || echo no), obs=${WITH_OBS}, pgadmin=${WITH_PGADMIN}"
 
 # Foto del estado previo (para auditar o revertir a mano si hiciera falta)
 if [[ "$DRY_RUN" != 1 ]]; then
@@ -448,7 +476,6 @@ REMOTE_APPLIED=0; CONFIGURED=0; LIVE_PORT=""
 HBA_BEGIN="# BEGIN install-postgres18: acceso remoto (bloque generado; se reemplaza al reconfigurar)"
 HBA_END="# END install-postgres18: acceso remoto"
 
-in_list() { local x="$1"; shift; local y; for y in "$@"; do [[ "$x" == "$y" ]] && return 0; done; return 1; }
 track_file() { # registra un archivo antes de modificarlo (respaldo una sola vez)
   local f="$1"
   if in_list "$f" ${NEW_FILES[@]+"${NEW_FILES[@]}"} ${CHANGED_FILES[@]+"${CHANGED_FILES[@]}"}; then return 0; fi
@@ -650,32 +677,117 @@ set_credentials() { # solo cluster nuevo
   info "Password de 'postgres' guardado en ${CRED_FILE}"
 }
 
-create_app() { # usuario y base propios para la aplicacion (no usar 'postgres' desde fuera)
+app_grant_sql() { # $1 = rol. Permisos completos en una base EXISTENTE (todos los esquemas de usuario)
+  cat <<SQL
+DO \$\$
+DECLARE s text; o text;
+BEGIN
+  FOR s IN SELECT nspname FROM pg_namespace
+           WHERE nspname NOT LIKE 'pg\_%' AND nspname <> 'information_schema' LOOP
+    EXECUTE format('GRANT USAGE, CREATE ON SCHEMA %I TO %I', s, '$1');
+    EXECUTE format('GRANT ALL ON ALL TABLES IN SCHEMA %I TO %I', s, '$1');
+    EXECUTE format('GRANT ALL ON ALL SEQUENCES IN SCHEMA %I TO %I', s, '$1');
+    EXECUTE format('GRANT ALL ON ALL ROUTINES IN SCHEMA %I TO %I', s, '$1');
+  END LOOP;
+  -- lo que creen en el futuro los duenos actuales (y postgres) tambien queda accesible
+  FOR o IN SELECT DISTINCT pg_get_userbyid(c.relowner) FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
+           UNION SELECT 'postgres' LOOP
+    CONTINUE WHEN o = '$1';
+    EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I GRANT ALL ON TABLES TO %I', o, '$1');
+    EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I GRANT ALL ON SEQUENCES TO %I', o, '$1');
+    EXECUTE format('ALTER DEFAULT PRIVILEGES FOR ROLE %I GRANT ALL ON ROUTINES TO %I', o, '$1');
+  END LOOP;
+END
+\$\$;
+SQL
+}
+
+app_owner_sql() { # $1 = rol. Traspasa a $1 los objetos de 'postgres' (no los de extensiones)
+  cat <<SQL
+DO \$\$
+DECLARE r record;
+BEGIN
+  FOR r IN SELECT n.nspname FROM pg_namespace n
+            WHERE n.nspowner = 'postgres'::regrole AND n.nspname NOT LIKE 'pg\_%'
+              AND n.nspname NOT IN ('information_schema', 'public') LOOP
+    EXECUTE format('ALTER SCHEMA %I OWNER TO %I', r.nspname, '$1');
+  END LOOP;
+  -- tablas, vistas, vistas materializadas, tablas foraneas y secuencias sueltas
+  FOR r IN SELECT c.oid::regclass AS obj, c.relkind FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relowner = 'postgres'::regrole
+              AND n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
+              AND c.relkind IN ('r','p','v','m','f','S')
+              AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass
+                               AND d.objid = c.oid AND d.deptype IN ('e','a','i')) LOOP
+    EXECUTE format('ALTER %s %s OWNER TO %I',
+      CASE r.relkind WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW'
+                     WHEN 'f' THEN 'FOREIGN TABLE' WHEN 'S' THEN 'SEQUENCE' ELSE 'TABLE' END,
+      r.obj, '$1');
+  END LOOP;
+  -- funciones y procedimientos
+  FOR r IN SELECT p.oid::regprocedure AS obj FROM pg_proc p
+             JOIN pg_namespace n ON n.oid = p.pronamespace
+            WHERE p.proowner = 'postgres'::regrole
+              AND n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
+              AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass
+                               AND d.objid = p.oid AND d.deptype = 'e') LOOP
+    EXECUTE format('ALTER ROUTINE %s OWNER TO %I', r.obj, '$1');
+  END LOOP;
+  -- tipos propios (enum, dominio, rango)
+  FOR r IN SELECT t.oid::regtype AS obj FROM pg_type t
+             JOIN pg_namespace n ON n.oid = t.typnamespace
+            WHERE t.typowner = 'postgres'::regrole AND t.typtype IN ('e','d','r')
+              AND n.nspname NOT LIKE 'pg\_%' AND n.nspname <> 'information_schema'
+              AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_type'::regclass
+                               AND d.objid = t.oid AND d.deptype = 'e') LOOP
+    EXECUTE format('ALTER TYPE %s OWNER TO %I', r.obj, '$1');
+  END LOOP;
+END
+\$\$;
+SQL
+}
+
+create_app() { # usuario propio para la aplicacion (por defecto 'jema') y sus bases
   [[ -n "$APP_USER" ]] || return 0
   if [[ "$PG_UP" != 1 ]]; then warn "Cluster inactivo: no se creo el usuario/base de la aplicacion."; return 0; fi
-  if [[ "$DRY_RUN" == 1 ]]; then echo "DRY: crear rol ${APP_USER} y base ${APP_DB} (dueno ${APP_USER})"; return 0; fi
-  local gen=0 pw_sql
-  if [[ -z "$APP_PASS" ]]; then APP_PASS="$(gen_pass)"; gen=1; fi
-  pw_sql="${APP_PASS//\'/\'\'}"
+  if [[ "$DRY_RUN" == 1 ]]; then
+    echo "DRY: rol ${APP_USER}; bases ${APP_DBS[*]} (nuevas: dueno ${APP_USER}; existentes: permisos${APP_OWNER:+ y traspaso de propiedad})"
+    return 0
+  fi
+  local pw_sql="${APP_PASS//\'/\'\'}" db saved_pw=1
   if [[ "$(psql_pg -tAc "SELECT 1 FROM pg_roles WHERE rolname='${APP_USER}'")" == 1 ]]; then
-    if [[ $gen -eq 1 ]]; then
-      info "El rol ${APP_USER} ya existe: se conserva su clave (use --app-password para cambiarla)."; APP_PASS=""
+    if [[ $APP_PASS_GIVEN -eq 1 ]]; then
+      psql_pg -qc "ALTER ROLE \"${APP_USER}\" LOGIN PASSWORD '${pw_sql}'"; info "Rol ${APP_USER}: clave actualizada."
     else
-      psql_pg -qc "ALTER ROLE \"${APP_USER}\" PASSWORD '${pw_sql}'"; info "Clave del rol ${APP_USER} actualizada."
+      info "El rol ${APP_USER} ya existe: se conserva su clave (use --app-password para cambiarla)."; saved_pw=0
     fi
   else
     psql_pg -qc "CREATE ROLE \"${APP_USER}\" LOGIN PASSWORD '${pw_sql}'"
     info "Rol ${APP_USER} creado."
   fi
-  if [[ "$(psql_pg -tAc "SELECT 1 FROM pg_database WHERE datname='${APP_DB}'")" == 1 ]]; then
-    warn "La base ${APP_DB} ya existe: no se modifica (dueno y permisos se mantienen)."
-  else
-    psql_pg -qc "CREATE DATABASE \"${APP_DB}\" OWNER \"${APP_USER}\" ENCODING 'UTF8' TEMPLATE template0"
-    info "Base ${APP_DB} creada (dueno ${APP_USER})."
-  fi
-  if [[ -n "$APP_PASS" ]]; then
-    ( umask 077; { echo "APP_USER=${APP_USER}"; echo "APP_DB=${APP_DB}"; echo "APP_PASSWORD=${APP_PASS}"; } >> "$CRED_FILE" )
-  fi
+  for db in "${APP_DBS[@]}"; do
+    if [[ "$(psql_pg -tAc "SELECT 1 FROM pg_database WHERE datname='${db}'")" == 1 ]]; then
+      psql_pg -qc "GRANT CONNECT, TEMPORARY, CREATE ON DATABASE \"${db}\" TO \"${APP_USER}\""
+      app_grant_sql "$APP_USER" | psql_pg -d "$db" -q -v ON_ERROR_STOP=1 \
+        || die "No se pudieron otorgar los permisos en ${db}."
+      info "Base existente ${db}: ${APP_USER} tiene permisos completos (tablas, secuencias, funciones y las futuras)."
+      if [[ -n "$APP_OWNER" ]]; then
+        psql_pg -qc "ALTER DATABASE \"${db}\" OWNER TO \"${APP_USER}\""
+        app_owner_sql "$APP_USER" | psql_pg -d "$db" -q -v ON_ERROR_STOP=1 \
+          || die "No se pudo traspasar la propiedad de los objetos de ${db}."
+        info "Base existente ${db}: dueno ${APP_USER} (base, esquemas, tablas, vistas, secuencias y funciones)."
+      fi
+    else
+      psql_pg -qc "CREATE DATABASE \"${db}\" OWNER \"${APP_USER}\" ENCODING 'UTF8' TEMPLATE template0"
+      info "Base ${db} creada (dueno ${APP_USER})."
+    fi
+  done
+  ( umask 077
+    { echo "APP_USER=${APP_USER}"; echo "APP_DB=${APP_DBS[*]}"
+      if [[ $saved_pw -eq 1 ]]; then echo "APP_PASSWORD=${APP_PASS}"; fi; } >> "$CRED_FILE" )
 }
 
 ssh_ports() { # puertos de SSH (para no cortarse al activar el firewall)
@@ -1063,7 +1175,12 @@ if [[ $REMOTE_APPLIED -eq 1 ]]; then
   info "Acceso remoto: SI (${HBA_TYPE}) desde ${ALLOW_LIST[*]:-CUALQUIER IP}"
   info "Desde otra PC: host=${SERVER_IP:-IP_DEL_SERVIDOR} port=${PG_PORT} dbname=${APP_DB:-postgres} user=${APP_USER:-postgres} sslmode=$([[ "$HBA_TYPE" == hostssl ]] && echo require || echo prefer)"
   [[ -z "$APP_USER" ]] && warn "Recomendado: un usuario propio para la aplicacion (--app-user) y --block-postgres-remote."
+  [[ -n "$APP_USER" && "$APP_PASS" == "$DEFAULT_PASS" ]] && warn "El usuario ${APP_USER} usa la clave por defecto (publica) con acceso remoto: cambiela o limite las IPs."
   warn "Si su proveedor de VPS tiene un firewall propio (panel web), abra tambien alli el puerto ${PG_PORT}."
+else
+  [[ -n "$APP_USER" ]] && info "Usuario de la aplicacion: ${APP_USER} (bases: ${APP_DBS[*]}; clave en ${CRED_FILE})"
+fi
+if [[ $REMOTE_APPLIED -eq 1 ]]; then :
 elif [[ $PRE_EXISTS -eq 0 || $CONFIGURED -eq 1 ]]; then
   info "Acceso remoto: NO (solo desde este servidor). Para activarlo: --configure-existing --remote"
 fi

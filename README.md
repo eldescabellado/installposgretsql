@@ -9,7 +9,8 @@ Los dos instalan lo mismo y aceptan **las mismas opciones**. Instalación nativa
 Pensado para servidores donde **ya corre otro sistema**: no borra ni sobrescribe nada existente.
 
 Configura en un solo paso: **puerto**, **acceso remoto** (listen_addresses, pg_hba.conf con SSL y
-firewall), **rendimiento** según la RAM y CPU del servidor, y un **usuario y base para su aplicación**.
+firewall), **rendimiento** según la RAM y CPU del servidor, y el **usuario `jema`** para la aplicación
+con permisos sobre sus bases (nuevas o ya existentes).
 Opcional: observabilidad (postgres_exporter + Prometheus + Grafana) y pgAdmin 4 web.
 
 ## Requisitos
@@ -35,7 +36,8 @@ cd installposgretsql
 sudo bash install-postgres18.sh
 ```
 
-Sin opciones, el instalador **pregunta**: puerto, si permite conexiones remotas, qué IPs y la clave.
+Sin opciones, el instalador **pregunta**: puerto, si permite conexiones remotas, qué IPs, las bases
+del usuario `jema` y la clave.
 Para actualizar el repositorio más adelante: `cd installposgretsql && git pull`.
 
 ## Instalación con un solo comando (sin clonar)
@@ -126,9 +128,9 @@ sudo bash /root/install-postgres18.sh --help
 - Apertura del puerto en el firewall (ufw o firewalld), solo para las IPs permitidas.
 
 ```bash
-# Puerto 5433, acceso solo desde dos origenes, usuario propio para el ERP
+# Puerto 5433, acceso solo desde dos origenes, usuario jema con la base del ERP
 sudo bash install-postgres18-ubuntu.sh --pg-port 5433 --remote --allow-cidr 190.1.2.3,10.0.0.0/24 \
-     --app-user erp_app --app-db erp_db --block-postgres-remote
+     --app-db erp_db_biovenezuela --block-postgres-remote
 
 # Desde cualquier IP (exige una clave propia: la por defecto es publica)
 sudo ADMIN_PASSWORD='ClaveLarga2026!' bash install-postgres18.sh --remote
@@ -141,7 +143,6 @@ sudo ADMIN_PASSWORD='ClaveLarga2026!' bash install-postgres18.sh --remote
 | `--allow-cidr LISTA` | IPs o redes permitidas, separadas por coma. Sin lista: cualquier IP |
 | `--no-ssl-required` | Permite conexiones remotas sin cifrar (`host` en vez de `hostssl`) |
 | `--block-postgres-remote` | El superusuario `postgres` solo entra desde el propio servidor |
-| `--app-user` / `--app-db` / `--app-password` | Crea un usuario y una base para la aplicación |
 | `--enable-firewall` | Si ufw/firewalld está inactivo, lo activa (permitiendo antes SSH) |
 | `--local-only` | Solo conexiones locales, sin preguntar |
 
@@ -163,6 +164,34 @@ sudo bash install-postgres18-ubuntu.sh --configure-existing --pg-port 5433     #
 ```
 Al reconfigurar, el bloque de `pg_hba.conf` se genera de nuevo con las opciones de **esa**
 ejecución: repita `--allow-cidr` y `--block-postgres-remote` si los usaba.
+
+## Usuario de la aplicación (`jema`)
+El instalador siempre crea el usuario **`jema`** con la **clave de administración** (`Jema2026#` si no
+la cambia), para que la aplicación no use el superusuario `postgres`. Los nombres van siempre en
+minúsculas: si escribe `JEMA` o `ERP_DB`, se pasan a minúsculas.
+
+| Opción | Qué hace |
+|---|---|
+| `--app-db LISTA` | Bases del usuario, separadas por coma (def. `jema`; si no se indica, pregunta) |
+| `--app-owner` | En bases existentes, además le traspasa la propiedad (base, esquemas, tablas, vistas, secuencias, funciones y tipos) |
+| `--app-user NOMBRE` | Otro nombre de usuario en vez de `jema` |
+| `--app-password CLAVE` | Otra clave para el usuario (o variable `APP_PASSWORD`) |
+| `--no-app-user` | No crea el usuario |
+
+- **Base nueva**: se crea con `jema` como dueño.
+- **Base existente** (por ejemplo la de su ERP): `jema` recibe permisos completos en todos los esquemas
+  sobre tablas, secuencias y funciones, también sobre las que se creen después. Con eso puede leer,
+  insertar, modificar y crear tablas. Para **modificar la estructura de las tablas existentes**
+  (`ALTER TABLE`, por ejemplo al actualizar el ERP) use `--app-owner`.
+- Si `jema` ya existe, se conserva su clave salvo que indique `--app-password`.
+
+```bash
+# Servidor que ya tiene la base del ERP
+sudo bash install-postgres18-ubuntu.sh --configure-existing --app-db erp_db_biovenezuela --app-owner
+```
+
+En la aplicación: `User_Name=jema`, `Password=` la clave de administración (está en
+`/root/.postgres18-credentials`).
 
 ## Rendimiento
 En un cluster nuevo se ajustan memoria y paralelismo según la RAM y los CPU
