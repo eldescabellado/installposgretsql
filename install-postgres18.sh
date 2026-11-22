@@ -31,7 +31,7 @@
 #   --remote               Permite conexiones remotas: listen_addresses='*', reglas en pg_hba.conf,
 #                          SSL y apertura del puerto en el firewall, todo de una vez
 #   --allow-cidr LISTA     IPs o redes permitidas, separadas por coma (ej: 190.1.2.3,10.0.0.0/24).
-#                          Sin lista, --remote permite CUALQUIER IP (exige una clave propia).
+#                          Sin lista, --remote permite CUALQUIER IP (se recomienda una clave propia).
 #                          Tambien limita el origen de los puertos que se abren (pgAdmin, Grafana)
 #   --no-ssl-required      Acepta conexiones remotas sin cifrar (pg_hba 'host' en vez de 'hostssl')
 #   --block-postgres-remote  El superusuario 'postgres' solo entra desde este servidor (la aplicacion
@@ -311,21 +311,11 @@ fi
 
 # ----------------------------- Clave de administracion -----------------------
 # Por defecto Jema2026#. Si hay terminal y no se indico --password, se ofrece cambiarla.
-# Remoto desde cualquier IP en un cluster nuevo: la clave por defecto (publica) no se acepta.
-_need_own=0
-[[ "$REMOTE" == 1 && ${#ALLOW_LIST[@]} -eq 0 && $PRE_EXISTS -eq 0 ]] && _need_own=1
 if [[ $PASS_GIVEN -eq 0 && $NO_PROMPT -eq 0 && "$DRY_RUN" != 1 && -n "$TTY_IN" ]]; then
   echo "Clave de administracion (postgres${APP_USER:+, ${APP_USER}}, pgAdmin, Grafana)."
-  [[ $_need_own -eq 1 ]] && echo "Permitio acceso remoto desde CUALQUIER IP: debe elegir una clave propia (la por defecto ${DEFAULT_PASS} es publica)."
   while :; do
-    if [[ $_need_own -eq 1 ]]; then
-      read -rsp "Nueva clave (minimo 8 caracteres): " _p1 < "$TTY_IN" || die "No se pudo leer la clave."; echo
-      if [[ -z "$_p1" ]]; then warn "La clave no puede quedar vacia."; continue; fi
-      if [[ "$_p1" == "$DEFAULT_PASS" ]]; then warn "Esa es la clave por defecto (publica). Elija otra."; continue; fi
-    else
-      read -rsp "Escriba otra clave o presione Enter para usar la por defecto (${DEFAULT_PASS}): " _p1 < "$TTY_IN" || die "No se pudo leer la clave."; echo
-      [[ -z "$_p1" ]] && break
-    fi
+    read -rsp "Escriba otra clave o presione Enter para usar la por defecto (${DEFAULT_PASS}): " _p1 < "$TTY_IN" || die "No se pudo leer la clave."; echo
+    [[ -z "$_p1" ]] && break
     if [[ ${#_p1} -lt 8 ]]; then warn "La clave debe tener al menos 8 caracteres. Intente de nuevo."; continue; fi
     read -rsp "Repita la clave: " _p2 < "$TTY_IN" || die "No se pudo leer la clave."; echo
     if [[ "$_p1" != "$_p2" ]]; then warn "Las claves no coinciden. Intente de nuevo."; continue; fi
@@ -335,10 +325,6 @@ if [[ $PASS_GIVEN -eq 0 && $NO_PROMPT -eq 0 && "$DRY_RUN" != 1 && -n "$TTY_IN" ]
 fi
 [[ ${#ADMIN_PASS} -ge 8 ]] || die "La clave debe tener al menos 8 caracteres."
 [[ -n "$APP_PASS" ]] || APP_PASS="$ADMIN_PASS"
-if [[ $_need_own -eq 1 && "$ADMIN_PASS" == "$DEFAULT_PASS" ]]; then
-  die "Acceso remoto desde CUALQUIER IP con la clave por defecto (es publica): indique otra con --password o al preguntar, o limite el origen con --allow-cidr."
-fi
-unset _need_own
 # pgAdmin rechaza correos con dominios reservados (.local, .localhost, .test, ...): la cuenta no se crearia.
 if [[ "$WITH_PGADMIN" == 1 ]]; then
   [[ "$PGADMIN_EMAIL" =~ ^[^@[:space:]]+@[^@[:space:]]+\.[A-Za-z]{2,}$ ]] || die "Correo de pgAdmin invalido: ${PGADMIN_EMAIL}"

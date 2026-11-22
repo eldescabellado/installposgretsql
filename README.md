@@ -132,7 +132,7 @@ sudo bash /root/install-postgres18.sh --help
 sudo bash install-postgres18-ubuntu.sh --pg-port 5433 --remote --allow-cidr 190.1.2.3,10.0.0.0/24 \
      --app-db erp_db_biovenezuela --block-postgres-remote
 
-# Desde cualquier IP (exige una clave propia: la por defecto es publica)
+# Desde cualquier IP (se recomienda una clave propia: la por defecto es publica)
 sudo ADMIN_PASSWORD='ClaveLarga2026!' bash install-postgres18.sh --remote
 ```
 
