@@ -125,7 +125,7 @@ sudo bash /root/install-postgres18.sh --help
 - Reglas en `pg_hba.conf` dentro de un bloque propio `BEGIN/END install-postgres18`, que se
   reemplaza completo al reconfigurar. Exigen **SSL** (`hostssl`) y clave (`scram-sha-256`).
 - **SSL**: Ubuntu ya lo trae activo; en CentOS se genera un certificado autofirmado.
-- Apertura del puerto en el firewall (ufw o firewalld), solo para las IPs permitidas.
+- Apertura del puerto en el firewall (ufw, firewalld o iptables) solo si hace falta, y solo para las IPs permitidas. Si ya estaba abierto o no hay firewall activo, no se toca.
 
 ```bash
 # Puerto 5433, acceso solo desde dos origenes, usuario jema con la base del ERP

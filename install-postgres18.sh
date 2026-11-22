@@ -17,7 +17,8 @@
 #   - Si Apache (httpd) ya esta activo, pgAdmin web se OMITE (agregaria /pgadmin4
 #     a todos sus sitios) salvo que use --force-pgadmin.
 #   - Si un puerto necesario esta ocupado, ese componente se omite sin tocar nada.
-#   - Firewall: solo AGREGA puertos. Jamas hace reset ni quita reglas.
+#   - Firewall (firewalld o iptables): abre el puerto solo si hace falta (si ya estaba
+#     permitido o no hay firewall activo, no toca nada). Jamas hace reset ni quita reglas.
 #   - Antes de cambiar algo guarda una foto del estado en /root/preinstall-snapshot-*.
 #
 # USO:
@@ -783,21 +784,68 @@ fw_enable() { # solo con --enable-firewall; permite SSH ANTES de activar
   run systemctl enable --now firewalld
   info "firewalld activado (SSH permitido en: $(ssh_ports | tr '\n' ' '))."
 }
-fw_open() { # puerto ; origen = ALLOW_LIST (vacia = cualquiera)
-  local port="$1" c fam
-  local -a src=(${ALLOW_LIST[@]+"${ALLOW_LIST[@]}"})
-  if ! systemctl is-active --quiet firewalld; then
-    warn "firewalld inactivo: no se agrego regla para ${port}/tcp (queda accesible si no hay otro firewall). Use --enable-firewall para activarlo."
+# iptables/nftables "a mano" (sin ufw ni firewalld): solo se toca si INPUT bloquea por defecto.
+ipt_blocks() { # comando (iptables|ip6tables)
+  have "$1" || return 1
+  "$1" -S INPUT 2>/dev/null | grep -Eq '^-P INPUT (DROP|REJECT)|^-A INPUT -j (DROP|REJECT)'
+}
+ipt_save() {
+  if have netfilter-persistent; then run netfilter-persistent save >/dev/null 2>&1 && return 0; fi
+  if [[ -f /etc/sysconfig/iptables ]] && have iptables-save; then
+    if [[ "$DRY_RUN" == 1 ]]; then echo "DRY: iptables-save > /etc/sysconfig/iptables"
+    else iptables-save > /etc/sysconfig/iptables; [[ -f /etc/sysconfig/ip6tables ]] && ip6tables-save > /etc/sysconfig/ip6tables; fi
     return 0
   fi
-  if (( ${#src[@]} == 0 )); then run firewall-cmd --permanent --add-port="${port}/tcp"
+  warn "Reglas iptables agregadas pero NO persistentes (se pierden al reiniciar). Instale iptables-persistent / iptables-services o use ufw/firewalld."
+}
+fw_open_ipt() { # puerto
+  local port="$1" c cmd added=0
+  local -a src=(${ALLOW_LIST[@]+"${ALLOW_LIST[@]}"}) args
+  (( ${#src[@]} )) || src=("")
+  for c in "${src[@]}"; do
+    for cmd in iptables ip6tables; do
+      [[ -n "$c" && "$cmd" == iptables && "$c" == *:* ]] && continue
+      [[ -n "$c" && "$cmd" == ip6tables && "$c" != *:* ]] && continue
+      ipt_blocks "$cmd" || continue
+      args=(INPUT -p tcp --dport "$port"); [[ -n "$c" ]] && args+=(-s "$c"); args+=(-j ACCEPT)
+      if "$cmd" -C "${args[@]}" 2>/dev/null; then continue; fi
+      run "$cmd" -I "${args[@]}" && added=1
+    done
+  done
+  if [[ $added -eq 1 ]]; then ipt_save; info "Firewall (iptables): abierto ${port}/tcp desde ${ALLOW_LIST[*]:-cualquier IP}"
+  else info "Firewall (iptables): ${port}/tcp ya estaba permitido."; fi
+}
+fw_firewalld_open() { # puerto ; agrega solo lo que falta (permanente; se recarga al final)
+  local port="$1" c fam rule any=0
+  local -a src=(${ALLOW_LIST[@]+"${ALLOW_LIST[@]}"})
+  if (( ${#src[@]} == 0 )); then
+    if firewall-cmd --permanent --query-port="${port}/tcp" >/dev/null 2>&1; then
+      info "Firewall (firewalld): ${port}/tcp ya estaba abierto."; return 0
+    fi
+    run firewall-cmd --permanent --add-port="${port}/tcp"; any=1
   else
     for c in "${src[@]}"; do
       fam=ipv4; [[ "$c" == *:* ]] && fam=ipv6
-      run firewall-cmd --permanent --add-rich-rule="rule family=${fam} source address=${c} port port=${port} protocol=tcp accept"
+      rule="rule family=${fam} source address=${c} port port=${port} protocol=tcp accept"
+      firewall-cmd --permanent --query-rich-rule="$rule" >/dev/null 2>&1 && continue
+      run firewall-cmd --permanent --add-rich-rule="$rule"; any=1
     done
   fi
-  FW_CHANGED=1; info "Firewall: abierto ${port}/tcp desde ${src[*]:-cualquier IP}"
+  if [[ $any -eq 1 ]]; then FW_CHANGED=1; info "Firewall (firewalld): abierto ${port}/tcp desde ${src[*]:-cualquier IP}"
+  else info "Firewall (firewalld): ${port}/tcp ya estaba permitido."; fi
+}
+fw_none_msg() { # puerto
+  info "Sin firewall activo en este equipo: ${1}/tcp no necesita abrirse aqui (si no conecta, revise el firewall del proveedor/router)."
+}
+fw_open() { # puerto ; origen = ALLOW_LIST (vacia = cualquiera). Solo abre si hace falta.
+  local port="$1"
+  if systemctl is-active --quiet firewalld 2>/dev/null; then
+    fw_firewalld_open "$port"
+  elif ipt_blocks iptables || ipt_blocks ip6tables; then
+    fw_open_ipt "$port"
+  else
+    fw_none_msg "$port"
+  fi
 }
 fw_reload() { if [[ $FW_CHANGED -eq 1 ]]; then run firewall-cmd --reload; fi; }
 
