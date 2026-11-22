@@ -260,7 +260,12 @@ done
 # ----------------------------- Pre-chequeos ----------------------------------
 [[ $EUID -eq 0 ]] || die "Ejecute como root (sudo)."
 [[ -r /etc/os-release ]] && . /etc/os-release
-CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+# Derivadas (Linux Mint, Pop!_OS, Zorin, LMDE...) tienen su propio codename (ej: Mint 22.3 = zena)
+# que no existe en los repos PGDG/pgAdmin: se usa el de la base Ubuntu/Debian.
+CODENAME="${UBUNTU_CODENAME:-${DEBIAN_CODENAME:-${VERSION_CODENAME:-}}}"
+if [[ -n "${VERSION_CODENAME:-}" && "$CODENAME" != "$VERSION_CODENAME" ]]; then
+  info "${NAME:-Distribucion} (${VERSION_CODENAME}) basada en ${CODENAME}: se usan los repositorios de ${CODENAME}."
+fi
 [[ -n "$CODENAME" ]] || die "No se pudo determinar el codename de la distribucion (/etc/os-release)."
 case "${ID:-}:${VERSION_ID:-}" in
   ubuntu:22.04|ubuntu:24.04|ubuntu:26.04|debian:12|debian:13) ;;
