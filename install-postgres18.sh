@@ -223,9 +223,21 @@ done
 # ----------------------------- Pre-chequeos ----------------------------------
 [[ $EUID -eq 0 ]] || die "Ejecute como root (sudo)."
 [[ -r /etc/os-release ]] && . /etc/os-release
+# Version EL base: sirve tambien para derivadas (Rocky, Alma, Oracle, CentOS Stream...)
+# que traen su propio nombre/version; los repos PGDG se publican por EL-8/9/10.
+EL_VER=""
+if [[ "${PLATFORM_ID:-}" =~ ^platform:el([0-9]+)$ ]]; then
+  EL_VER="${BASH_REMATCH[1]}"
+elif [[ " ${ID:-} ${ID_LIKE:-} " =~ \ (rhel|centos)\  ]]; then
+  EL_VER="${VERSION_ID%%.*}"
+fi
+case "$EL_VER" in
+  8|9|10) ;;
+  *) die "No se pudo determinar una version EL soportada (8, 9 o 10) en ${PRETTY_NAME:-este sistema} (/etc/os-release).";;
+esac
 case "${ID:-}:${VERSION_ID%%.*}" in
   centos:10|rhel:10|rocky:10|almalinux:10) ;;
-  *) warn "SO detectado: ${PRETTY_NAME:-desconocido}. Pensado para CentOS/RHEL 10; continuando bajo su riesgo.";;
+  *) warn "SO detectado: ${PRETTY_NAME:-desconocido} (base EL${EL_VER}). Pensado para CentOS/RHEL 10; continuando bajo su riesgo.";;
 esac
 [[ "$(uname -m)" == "x86_64" || "$(uname -m)" == "aarch64" ]] || die "Arquitectura no soportada."
 
@@ -377,8 +389,8 @@ install_repo() {
   if rpm -q pgdg-redhat-repo >/dev/null 2>&1; then
     info "Repositorio PGDG ya instalado."
   else
-    info "Instalando repositorio PGDG (EL-10)..."
-    run dnf install -y "https://download.postgresql.org/pub/repos/yum/reporpms/EL-10-$(uname -m)/pgdg-redhat-repo-latest.noarch.rpm"
+    info "Instalando repositorio PGDG (EL-${EL_VER})..."
+    run dnf install -y "https://download.postgresql.org/pub/repos/yum/reporpms/EL-${EL_VER}-$(uname -m)/pgdg-redhat-repo-latest.noarch.rpm"
   fi
   # Nota: NO se deshabilita ningun modulo de AppStream. Los paquetes PGDG se llaman
   # postgresql18-* y no chocan con otros PostgreSQL instalados en el servidor.
@@ -1023,7 +1035,7 @@ install_pgadmin() {
 
   if ! rpm -q pgadmin4-redhat-repo >/dev/null 2>&1; then
     run dnf install -y "https://ftp.postgresql.org/pub/pgadmin/pgadmin4/yum/pgadmin4-redhat-repo-2-1.noarch.rpm" \
-      || { warn "Repo pgAdmin no disponible para EL10. Alternativa nativa: pip install pgadmin4 dentro de un venv, o use solo Grafana."; return 0; }
+      || { warn "Repo pgAdmin no disponible para EL${EL_VER}. Alternativa nativa: pip install pgadmin4 dentro de un venv, o use solo Grafana."; return 0; }
   fi
   run dnf install -y pgadmin4-web || { warn "No se pudo instalar pgadmin4-web en esta version de SO."; return 0; }
 
